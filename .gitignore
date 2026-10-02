@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Notebooks y sistema
+.DS_Store
+Thumbs.db
+
+# Datos y resultados generados localmente
+/data/raw/
+/data/processed/
+/models/
+/results/*
+!/results/README.md
+
+# No versionar archivos descargados o artefactos de ejecución
+*.joblib
+*.pkl
+*.zip
