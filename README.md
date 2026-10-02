@@ -2,7 +2,7 @@
 
 Proyecto grupal de **Ciencia de Datos** sobre clasificación binaria de comentarios universitarios escritos en español mediante procesamiento de lenguaje natural (PLN). Se compararán un **Transformer preentrenado ajustado mediante fine-tuning** y un modelo base de **TF-IDF + Regresión Logística**.
 
-> **Estado actual:** la documentación del repositorio y la parte de datos/modelo base de Diego se están integrando. El notebook principal se incorporará desde la versión ejecutada de Google Colab. El Transformer, la comparación y la evaluación final todavía están pendientes. Las métricas expuestas aquí provienen de **validación**, no de prueba.
+> **Estado actual:** la documentación y el notebook de datos/modelo base de Diego (etapas 1–5) ya están publicados desde la versión ejecutada en Google Colab. El Transformer, la comparación y la evaluación final todavía están pendientes. Las métricas expuestas aquí provienen de **validación**, no de prueba.
 
 ## Integrantes
 
@@ -30,18 +30,19 @@ pln-sentimiento-estudiantil/
 ├── data/
 │   └── README.md
 ├── notebooks/
-│   └── README.md
+│   ├── README.md
+│   └── 01_datos_y_modelo_base.ipynb
 ├── docs/
 │   └── referencias.md
 └── results/
     └── README.md
 ```
 
-El archivo `notebooks/01_datos_y_modelo_base.ipynb` se añadirá conservando el notebook original con sus salidas. Más adelante se incorporará el trabajo real del Transformer, sin crear archivos vacíos ni resultados anticipados.
+El archivo [`notebooks/01_datos_y_modelo_base.ipynb`](notebooks/01_datos_y_modelo_base.ipynb) ya está publicado conservando íntegramente el notebook original y sus salidas. Más adelante se incorporará el trabajo real del Transformer, sin crear archivos vacíos ni resultados anticipados.
 
 ## Reproducir el proyecto
 
-**Google Colab (recomendado):** una vez añadido el notebook, abrir `notebooks/01_datos_y_modelo_base.ipynb` desde **Archivo → Abrir cuaderno → GitHub**, buscando este repositorio. Para reproducir las dependencias documentadas, antes de ejecutar el notebook se puede usar una celda nueva:
+**Google Colab (recomendado):** abrir `notebooks/01_datos_y_modelo_base.ipynb` desde **Archivo → Abrir cuaderno → GitHub**, buscando este repositorio. Para reproducir las dependencias documentadas, antes de ejecutar el notebook se puede usar una celda nueva:
 
 ```python
 !git clone https://github.com/diegoSpatinob/pln-sentimiento-estudiantil.git
