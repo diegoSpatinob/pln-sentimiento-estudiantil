@@ -1,19 +1,25 @@
-"""Fase 1C: configuración, datos verificados y longitudes de train; sin entrenamiento.
+"""Infraestructura BETO: preanálisis (1C) y preparación del fine-tuning (2A).
 
 Desde la raíz, reproducir sin cambiar la configuración:
     python -m scripts.transformer
 Registrar explícitamente la longitud derivada de train:
     python -m scripts.transformer --record-max-length
-Solo se descargan archivos del tokenizer, en una caché ignorada por Git.
+El modo predeterminado solo descarga el tokenizer. --smoke-test requiere una
+invocación explícita y dependencias de entrenamiento. No hay CLI para T1/T2/T3.
+Importar este módulo nunca inicializa ni entrena un modelo.
 """
 
 import argparse
 import hashlib
 import json
+import os
+import platform
 import random
 import re
+from dataclasses import dataclass
 from importlib.metadata import version
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 
@@ -288,13 +294,473 @@ def save_analysis(analysis, path=ANALYSIS_PATH):
     return path
 
 
+def load_training_frames(base_dir=ROOT):
+    """Solo devuelve train/validation; test se verifica por Fase 0 y se descarta."""
+    partitions = load_verified_partitions(base_dir)
+    return {name: partitions[name] for name in ("train", "validation")}
+
+
+def _smoke_frame(frame, seed):
+    """16 registros por clase en train o 8 en validation; muestreo determinista."""
+    per_class = 16 if len(frame) == EXPECTED_SIZES["train"] else 8
+    rng = np.random.default_rng(seed)
+    indices = []
+    for label in (0, 1):
+        eligible = frame.loc[frame["sentimiento_id"].eq(label), "indice_original"].to_numpy()
+        indices.extend(rng.choice(eligible, size=per_class, replace=False).tolist())
+    rng.shuffle(indices)
+    return frame.loc[indices]
+
+
+@dataclass(frozen=True)
+class DevelopmentDataset:
+    """Dataset de estilo map para DataLoader; no necesita torch al prepararse.
+
+    Los registros solo contienen entradas del tokenizer y labels. Los índices y
+    la procedencia se guardan fuera de __getitem__, nunca se entregan al modelo.
+    Las tuplas internas y las copias devueltas evitan mutaciones accidentales.
+    """
+
+    split: str
+    indice_original: tuple
+    features: tuple
+    labels: tuple
+    source_sha256: str
+    model_id: str
+    model_revision: str
+    max_length: int
+    smoke: bool
+
+    def __post_init__(self):
+        _require(self.split in {"train", "validation"}, "test no es un dataset de desarrollo.")
+        _require(len(self.features) == len(self.labels) == len(self.indice_original)
+                 and len(self.labels) > 0, "Dataset vacío o de tamaños inconsistentes.")
+        _require(len(set(self.indice_original)) == len(self.indice_original), "Índices repetidos.")
+        _require(set(self.labels).issubset({0, 1}), "Etiquetas inválidas.")
+        _require(self.max_length == 128, "El entrenamiento requiere max_length=128.")
+        for record in self.features:
+            fields = dict(record)
+            _require({"input_ids", "attention_mask"}.issubset(fields)
+                     and set(fields).issubset({"input_ids", "attention_mask", "token_type_ids"}),
+                     "Campos ajenos a las entradas predictivas del tokenizer.")
+            length = len(fields["input_ids"])
+            _require(0 < length <= 128 and all(len(value) == length for value in fields.values()),
+                     "Longitudes tokenizadas inconsistentes.")
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, index):
+        item = {name: list(value) for name, value in self.features[index]}
+        item["labels"] = self.labels[index]
+        return item
+
+
+def prepare_training_datasets(tokenizer, config, base_dir=ROOT, smoke=False, batch_size=128):
+    """Convierte solamente train/validation oficiales; no acepta un split externo.
+
+    Tokenización con truncamiento a 128 y sin padding fijo. El padding posterior
+    lo realiza DataCollatorWithPadding por batch. No modifica los DataFrames.
+    """
+    validate_config(config)
+    _require(config["max_length"] == 128, "Fase 1C debe haber registrado max_length=128.")
+    _require(tokenizer.name_or_path == config["model_id"], "Tokenizer no corresponde a BETO.")
+    _require(type(smoke) is bool and type(batch_size) is int and batch_size > 0,
+             "Modo o batch de tokenización inválido.")
+    datasets = {}
+    for name, original in load_training_frames(base_dir).items():
+        frame = _smoke_frame(original, config["seed"]) if smoke else original
+        features = []
+        texts = frame[config["text_column"]]
+        for start in range(0, len(frame), batch_size):
+            encoded = tokenizer(texts.iloc[start:start + batch_size].tolist(),
+                                max_length=128, truncation=True, padding=False,
+                                add_special_tokens=True, return_attention_mask=True)
+            _require(set(encoded).issubset({"input_ids", "attention_mask", "token_type_ids"}),
+                     "Tokenizer devolvió campos no autorizados.")
+            for i in range(len(encoded["input_ids"])):
+                features.append(tuple((key, tuple(values[i])) for key, values in encoded.items()))
+        datasets[name] = DevelopmentDataset(
+            split=name, indice_original=tuple(int(i) for i in frame["indice_original"]),
+            features=tuple(features), labels=tuple(int(i) for i in frame[config["target_column"]]),
+            source_sha256=_file_hash(Path(base_dir) / f"data/processed/{name}.csv"),
+            model_id=config["model_id"], model_revision=config["model_revision"],
+            max_length=128, smoke=smoke,
+        )
+    return datasets
+
+
+def guard_development_dataset(dataset, expected_split, base_dir=ROOT):
+    """Rechaza test, datasets externos y registros atribuidos al split equivocado."""
+    _require(expected_split in {"train", "validation"}, "test está reservado para la fase final.")
+    _require(isinstance(dataset, DevelopmentDataset) and dataset.split == expected_split,
+             f"Solo se permite el dataset verificado de {expected_split}; test está prohibido.")
+    frames = load_training_frames(base_dir)
+    reference = frames[expected_split]
+    if dataset.smoke:
+        reference = _smoke_frame(reference, 42)
+    _require(dataset.indice_original == tuple(int(i) for i in reference["indice_original"])
+             and dataset.labels == tuple(int(i) for i in reference["sentimiento_id"]),
+             "Procedencia o etiquetas distintas de la partición autorizada.")
+    config = load_config(Path(base_dir) / "configs/transformer.json")
+    _require(dataset.source_sha256 == _file_hash(Path(base_dir) / f"data/processed/{expected_split}.csv")
+             and dataset.model_id == config["model_id"]
+             and dataset.model_revision == config["model_revision"] and dataset.max_length == 128,
+             "Dataset preparado con datos o tokenizer distintos.")
+    return dataset
+
+
+def compute_metrics(eval_prediction, include_per_class=True):
+    """Métricas binarias, compatibles con EvalPrediction; admite pruebas sintéticas."""
+    from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+
+    if hasattr(eval_prediction, "predictions"):
+        logits, labels = eval_prediction.predictions, eval_prediction.label_ids
+    else:
+        logits, labels = eval_prediction
+    logits = np.asarray(logits[0] if isinstance(logits, tuple) else logits)
+    labels = np.asarray(labels)
+    _require(logits.shape == (labels.size, 2) and labels.ndim == 1 and labels.size > 0
+             and np.isfinite(logits).all() and set(labels.tolist()).issubset({0, 1}),
+             "Se requieren logits finitos (n,2) y etiquetas binarias (n,).")
+    predicted = logits.argmax(axis=-1)
+    precision, recall, f1, support = precision_recall_fscore_support(
+        labels, predicted, labels=[0, 1], average=None, zero_division=0)
+    metrics = {"f1_macro": float(f1.mean()), "accuracy": float(accuracy_score(labels, predicted)),
+               "precision_macro": float(precision.mean()), "recall_macro": float(recall.mean())}
+    if include_per_class:
+        for i in (0, 1):
+            metrics.update({f"precision_class_{i}": float(precision[i]),
+                            f"recall_class_{i}": float(recall[i]), f"f1_class_{i}": float(f1[i]),
+                            f"support_class_{i}": int(support[i])})
+    return metrics
+
+
+def detect_runtime(device="auto"):
+    """Detecta CPU/CUDA y registra versiones/capacidades sin entrenar ni escribir."""
+    _require(device in {"auto", "cpu", "cuda"}, "Dispositivo debe ser auto, cpu o cuda.")
+    info = {"python": platform.python_version(), "transformers": version("transformers"),
+            "torch_available": False, "torch": None, "cuda_runtime": None,
+            "cuda_available": False, "gpu": [], "device": None,
+            "precision_support": {"fp32": False, "fp16": False, "bf16": False}}
+    try:
+        import torch
+    except ModuleNotFoundError as error:
+        if error.name != "torch":
+            raise
+        return info
+    available = torch.cuda.is_available() and torch.version.cuda is not None
+    _require(device != "cuda" or available, "CUDA solicitado pero no disponible.")
+    chosen = "cuda" if device == "cuda" or (device == "auto" and available) else "cpu"
+    info.update(torch_available=True, torch=torch.__version__, cuda_runtime=torch.version.cuda,
+                cuda_available=available, device=chosen)
+    if available:
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            info["gpu"].append({"index": i, "name": props.name,
+                                "memory_bytes": props.total_memory,
+                                "compute_capability": [props.major, props.minor]})
+    info["precision_support"]["fp32"] = True
+    if chosen == "cuda":
+        capability = torch.cuda.get_device_capability(torch.cuda.current_device())
+        info["precision_support"].update(fp16=capability >= (5, 3),
+                                         bf16=torch.cuda.is_bf16_supported(including_emulation=False))
+    return info
+
+
+def _require_training_backend():
+    """Dependencias diferidas: el preanálisis sigue funcionando sin PyTorch."""
+    from importlib.metadata import PackageNotFoundError
+    from packaging.version import Version
+
+    try:
+        torch_version, accelerate_version = version("torch"), version("accelerate")
+    except PackageNotFoundError as error:
+        raise RuntimeError("Entrenamiento requiere PyTorch y Accelerate; instalar en Colab "
+                           "según requirements-transformer.txt y su entorno CPU/GPU.") from error
+    _require(Version("2.6") <= Version(torch_version) < Version("3"),
+             "BETO original en formato .bin requiere torch>=2.6,<3 con Transformers 4.57.1.")
+    _require(Version(accelerate_version) >= Version("0.26"), "Accelerate demasiado antiguo.")
+    _require(version("transformers") == "4.57.1", "Validar de nuevo la API si cambia Transformers.")
+
+
+def initialize_original_model(config, base_dir=ROOT, local_files_only=False):
+    """Cada inicialización parte de BETO original; nunca de T1/T2/T3 ni del smoke."""
+    validate_config(config)
+    registered = load_config(Path(base_dir) / "configs/transformer.json")
+    _require(config["model_revision"] == registered["model_revision"],
+             "La revisión debe coincidir con el checkpoint original registrado.")
+    _require_training_backend()
+    set_seed(config["seed"])
+    from transformers import AutoModelForSequenceClassification
+
+    return AutoModelForSequenceClassification.from_pretrained(
+        config["model_id"], revision=config["model_revision"], num_labels=2,
+        id2label={value: key for key, value in config["label_mapping"].items()},
+        label2id=config["label_mapping"].copy(), trust_remote_code=False,
+        local_files_only=local_files_only,
+        cache_dir=str(Path(base_dir) / "models/transformer/pretrained_cache"),
+    )
+
+
+def training_argument_values(config, experiment_id, learning_rate, physical_batch_size,
+                             precision, runtime, base_dir=ROOT, smoke=False):
+    """Plan de argumentos sin inicializar Trainer/modelo ni seleccionar hiperparámetros.
+
+    Batch y precisión deben indicarse explícitamente después de inspeccionar Colab.
+    Se admite un solo proceso/dispositivo para garantizar batch efectivo 16.
+    """
+    validate_config(config)
+    _require(config["max_length"] == 128, "max_length de entrenamiento debe ser 128.")
+    _require(learning_rate in config["learning_rates"], "Learning rate fuera del protocolo.")
+    _require(type(physical_batch_size) is int and physical_batch_size in {8, 16},
+             "Batch físico debe ser 8 o 16.")
+    _require(precision in {"fp32", "fp16", "bf16"}, "Indicar explícitamente la precisión.")
+    _require(runtime["torch_available"] and runtime["device"] in {"cpu", "cuda"},
+             "PyTorch/dispositivo no disponible.")
+    _require(runtime["precision_support"][precision], "Precisión no soportada por el dispositivo.")
+    _require(int(os.environ.get("WORLD_SIZE", "1")) == 1
+             and (runtime["device"] != "cuda" or len(runtime["gpu"]) == 1),
+             "Usar un único proceso/GPU visible para conservar batch efectivo 16.")
+    if smoke:
+        _require(re.fullmatch(r"SMOKE_[A-Za-z0-9_-]+", experiment_id), "ID smoke debe empezar por SMOKE_.")
+        relative = Path("models/transformer/smoke") / experiment_id
+    else:
+        _require(experiment_id in {"T1", "T2", "T3"}, "ID oficial debe ser T1, T2 o T3.")
+        relative = Path("models/transformer") / experiment_id
+    return {
+        "output_dir": str(Path(base_dir) / relative), "run_name": experiment_id,
+        "learning_rate": learning_rate, "weight_decay": config["weight_decay"],
+        "num_train_epochs": 1 if smoke else config["max_epochs"], "max_steps": 2 if smoke else -1,
+        "per_device_train_batch_size": physical_batch_size,
+        "per_device_eval_batch_size": physical_batch_size,
+        "gradient_accumulation_steps": 16 // physical_batch_size,
+        "eval_strategy": "epoch", "save_strategy": "epoch", "logging_strategy": "epoch",
+        "load_best_model_at_end": True, "metric_for_best_model": "f1_macro",
+        "greater_is_better": True, "save_total_limit": 2, "save_safetensors": True,
+        "seed": config["seed"], "data_seed": config["seed"],
+        "fp16": precision == "fp16", "bf16": precision == "bf16",
+        "use_cpu": runtime["device"] == "cpu", "optim": "adamw_torch",
+        "lr_scheduler_type": "linear", "warmup_steps": 0,
+        "dataloader_num_workers": 0, "dataloader_pin_memory": runtime["device"] == "cuda",
+        "remove_unused_columns": False, "label_names": ["labels"],
+        "report_to": "none", "push_to_hub": False,
+    }
+
+
+def build_training_arguments(*args, **kwargs):
+    """Construye TrainingArguments con la API comprobada de Transformers 4.57.1."""
+    values = training_argument_values(*args, **kwargs)
+    _require_training_backend()
+    from transformers import TrainingArguments
+
+    arguments = TrainingArguments(**values)
+    _require(arguments.world_size == 1 and arguments.n_gpu <= 1,
+             "El batch efectivo 16 requiere un único proceso/dispositivo.")
+    return arguments
+
+
+def development_trainer_class(base_dir=ROOT):
+    """Trainer protegido; incluso sus métodos públicos rechazan test y reanudación."""
+    _require_training_backend()
+    from transformers import Trainer
+
+    class DevelopmentTrainer(Trainer):
+        def __init__(self, *args, **kwargs):
+            guard_development_dataset(kwargs.get("train_dataset"), "train", base_dir)
+            guard_development_dataset(kwargs.get("eval_dataset"), "validation", base_dir)
+            self._started = False
+            self._best_validation_key = None
+            super().__init__(*args, **kwargs)
+
+        def train(self, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None, **kwargs):
+            _require(resume_from_checkpoint is None or resume_from_checkpoint is False,
+                     "No se reutilizan checkpoints entre experimentos.")
+            _require(not self._started and trial is None, "Crear un Trainer nuevo para cada ejecución.")
+            guard_development_dataset(self.train_dataset, "train", base_dir)
+            guard_development_dataset(self.eval_dataset, "validation", base_dir)
+            _require(not any(Path(self.args.output_dir).glob("checkpoint-*")),
+                     "El directorio ya contiene checkpoints; no se reutiliza.")
+            self._started = True
+            return super().train(resume_from_checkpoint=False, trial=None,
+                                 ignore_keys_for_eval=ignore_keys_for_eval, **kwargs)
+
+        def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+            dataset = self.eval_dataset if eval_dataset is None else eval_dataset
+            guard_development_dataset(dataset, "validation", base_dir)
+            return super().evaluate(dataset, ignore_keys, metric_key_prefix)
+
+        def predict(self, test_dataset, ignore_keys=None, metric_key_prefix="validation"):
+            # test_dataset es el nombre de la API HF; aquí solo se admite validation.
+            guard_development_dataset(test_dataset, "validation", base_dir)
+            return super().predict(test_dataset, ignore_keys, metric_key_prefix)
+
+        def get_train_dataloader(self):
+            guard_development_dataset(self.train_dataset, "train", base_dir)
+            return super().get_train_dataloader()
+
+        def get_eval_dataloader(self, eval_dataset=None):
+            dataset = self.eval_dataset if eval_dataset is None else eval_dataset
+            guard_development_dataset(dataset, "validation", base_dir)
+            return super().get_eval_dataloader(dataset)
+
+        def get_test_dataloader(self, test_dataset):
+            guard_development_dataset(test_dataset, "validation", base_dir)
+            return super().get_test_dataloader(test_dataset)
+
+        def hyperparameter_search(self, *args, **kwargs):
+            raise ValueError("La selección entre T1/T2/T3 corresponde a una fase posterior.")
+
+        def _determine_best_metric(self, metrics, trial):
+            # API interna comprobada en 4.57.1. Dentro del run LR es constante;
+            # empates en F1 a 4 decimales se resuelven por accuracy y época temprana.
+            f1, accuracy = float(metrics["eval_f1_macro"]), float(metrics["eval_accuracy"])
+            _require(np.isfinite([f1, accuracy]).all(), "Métricas no finitas.")
+            key = (round(f1, 4), accuracy)
+            if self._best_validation_key is None or key > self._best_validation_key:
+                self._best_validation_key = key
+                self.state.best_metric = f1
+                self.state.best_global_step = self.state.global_step
+                return True
+            return False
+
+    return DevelopmentTrainer
+
+
+def build_trainer(config, tokenizer, datasets, experiment_id, learning_rate,
+                  physical_batch_size, precision, device="auto", base_dir=ROOT,
+                  smoke=False, local_files_only=False):
+    """Preparación explícita para ejecución posterior; esta función no llama train().
+
+    Trainer inicializa el modelo al construirse: invocar solo en el entorno futuro.
+    Los directorios deben ser nuevos. No acepta modelos/checkpoints alternativos.
+    """
+    # Fija una copia del protocolo para model_init y el manifiesto: un cambio en
+    # el diccionario del llamador no puede alterar inicializaciones posteriores.
+    config = json.loads(_json_bytes(config))
+    _require(set(datasets) == {"train", "validation"}, "Solo train/validation están autorizados.")
+    for name, dataset in datasets.items():
+        guard_development_dataset(dataset, name, base_dir)
+        _require(dataset.smoke is smoke, "No mezclar datasets smoke y oficiales.")
+    runtime = detect_runtime(device)
+    values = training_argument_values(config, experiment_id, learning_rate, physical_batch_size,
+                                      precision, runtime, base_dir, smoke)
+    output = Path(values["output_dir"])
+    _require(not output.exists(), "Directorio de experimento ya existente; no se sobrescribe ni reanuda.")
+    arguments = build_training_arguments(config, experiment_id, learning_rate, physical_batch_size,
+                                         precision, runtime, base_dir, smoke)
+    trainer_type = development_trainer_class(base_dir)
+    from transformers import DataCollatorWithPadding
+
+    output.mkdir(parents=True, exist_ok=False)
+    trainer = trainer_type(
+        args=arguments, model_init=lambda: initialize_original_model(config, base_dir, local_files_only),
+        train_dataset=datasets["train"], eval_dataset=datasets["validation"],
+        data_collator=DataCollatorWithPadding(tokenizer=tokenizer, padding=True, return_tensors="pt"),
+        processing_class=tokenizer, compute_metrics=compute_metrics,
+    )
+    manifest = {
+        "status": "PREPARED_NO_TRAINING_RESULTS", "official": not smoke,
+        "purpose": "SMOKE_TEST_NO_OFICIAL" if smoke else "FUTURE_EXPERIMENT",
+        "experiment_id": experiment_id, "configuration": config, "runtime": runtime,
+        "accelerate": version("accelerate"), "training_arguments": arguments.to_dict(),
+        "initial_checkpoint": {"model_id": config["model_id"], "revision": config["model_revision"]},
+        "data": {name: {"records": len(dataset), "sha256": dataset.source_sha256,
+                         "indice_original": list(dataset.indice_original)}
+                 for name, dataset in datasets.items()},
+        "test_policy": config["test_policy"],
+    }
+    (output / "run_manifest.json").write_bytes(_json_bytes(manifest))
+    return trainer
+
+
+def run_smoke_test(learning_rate, physical_batch_size, precision, device="auto",
+                   base_dir=ROOT, run_id=None, local_files_only=False):
+    """Único ejecutor de esta fase: 32 train/16 validation, 2 pasos, NO OFICIAL.
+
+    Ejecuta forward/backward, validación, checkpoint y recarga local de su propio
+    resultado técnico. No altera configuración ni realiza selección T1/T2/T3.
+    """
+    _require_training_backend()
+    config = load_config(Path(base_dir) / "configs/transformer.json")
+    runtime = detect_runtime(device)
+    run_id = run_id or f"SMOKE_{uuid4().hex[:12]}"
+    training_argument_values(config, run_id, learning_rate, physical_batch_size,
+                             precision, runtime, base_dir, smoke=True)
+    result_dir = Path(base_dir) / "results/transformer/smoke" / run_id
+    _require(not result_dir.exists(), "Resultados de smoke ya existentes.")
+    set_seed(config["seed"])
+    tokenizer = load_tokenizer(config, base_dir, local_files_only)
+    datasets = prepare_training_datasets(tokenizer, config, base_dir, smoke=True)
+    trainer = build_trainer(config, tokenizer, datasets, run_id, learning_rate,
+                            physical_batch_size, precision, device, base_dir,
+                            smoke=True, local_files_only=local_files_only)
+    import torch
+
+    initial_head = {key: value.detach().cpu().clone()
+                    for key, value in trainer.model.classifier.state_dict().items()}
+    outcome = trainer.train(resume_from_checkpoint=False)
+    _require(any(not torch.equal(value, trainer.model.classifier.state_dict()[key].detach().cpu())
+                 for key, value in initial_head.items()),
+             "El smoke no verificó una actualización efectiva de la cabeza de clasificación.")
+    metrics = trainer.evaluate()
+    checkpoint = trainer.state.best_model_checkpoint
+    _require(checkpoint is not None and Path(checkpoint).is_relative_to(Path(trainer.args.output_dir)),
+             "No se guardó un mejor checkpoint dentro de este smoke.")
+    _require(outcome.global_step == 2, "El smoke debe ejecutar exactamente dos pasos de optimización.")
+    saved = Path(trainer.args.output_dir) / "smoke_saved_model"
+    trainer.save_model(str(saved))
+    from transformers import AutoModelForSequenceClassification
+
+    # Única excepción a la inicialización original: probar la recarga del smoke
+    # guardado. Este modelo se descarta y jamás inicializa un experimento oficial.
+    reloaded = AutoModelForSequenceClassification.from_pretrained(str(saved), local_files_only=True)
+    reloaded.to(trainer.args.device)
+    reloaded.eval()
+    trainer.model.eval()
+    sample = [datasets["validation"][i] for i in range(min(2, len(datasets["validation"])))]
+    batch = {key: value.to(trainer.args.device) for key, value in trainer.data_collator(sample).items()}
+    with torch.no_grad():
+        original_output = trainer.model(**batch)
+        reloaded_output = reloaded(**batch)
+    _require(torch.isfinite(reloaded_output.loss).item()
+             and torch.allclose(original_output.logits, reloaded_output.logits, rtol=1e-4, atol=1e-4),
+             "La recarga técnica no conserva resultados de validation.")
+    result = {"purpose": "SMOKE_TEST_NO_OFICIAL", "official": False,
+              "not_for_comparison_or_hyperparameter_selection": True,
+              "run_id": run_id, "train_records": 32, "validation_records": 16,
+              "optimizer_steps": outcome.global_step, "validation_metrics_non_official": metrics,
+              "checkpoint": str(checkpoint), "parameter_update_verified": True,
+              "save_reload_verified": True,
+              "test_used": False, "runtime": runtime}
+    result_dir.mkdir(parents=True, exist_ok=False)
+    (result_dir / "smoke_test_NO_OFICIAL.json").write_bytes(_json_bytes(result))
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--record-max-length", action="store_true",
                         help="Actualiza explícitamente configs/transformer.json después del análisis.")
     parser.add_argument("--local-files-only", action="store_true",
                         help="Usa únicamente el tokenizer ya descargado en la caché local.")
+    parser.add_argument("--smoke-test", action="store_true", help="Ejecuta el smoke técnico NO OFICIAL.")
+    parser.add_argument("--learning-rate", type=float, choices=[1e-5, 2e-5, 3e-5])
+    parser.add_argument("--physical-batch-size", type=int, choices=[8, 16])
+    parser.add_argument("--precision", choices=["fp32", "fp16", "bf16"])
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     args = parser.parse_args()
+    if args.smoke_test:
+        if args.record_max_length:
+            parser.error("El smoke no modifica configs/transformer.json.")
+        if any(value is None for value in (args.learning_rate, args.physical_batch_size, args.precision)):
+            parser.error("Smoke requiere --learning-rate, --physical-batch-size y --precision explícitos.")
+        result = run_smoke_test(args.learning_rate, args.physical_batch_size, args.precision,
+                                args.device, local_files_only=args.local_files_only)
+        print(_json_bytes(result).decode("utf-8"), end="")
+        return
+    if any(value is not None for value in (args.learning_rate, args.physical_batch_size, args.precision)):
+        parser.error("Los argumentos de entrenamiento requieren --smoke-test.")
     config = load_config()
     set_seed(config["seed"])
     tokenizer = load_tokenizer(config, local_files_only=args.local_files_only)
