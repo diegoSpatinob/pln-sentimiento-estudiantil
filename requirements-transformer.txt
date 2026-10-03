@@ -1,12 +1,23 @@
-# Fase 1C: tokenizer de BETO; instalar junto al entorno existente de Fase 0.
+# Fases 1C/2A: BETO; utilizar junto al entorno existente de Fase 0.
 # Python 3.12 compatible: https://pypi.org/project/transformers/4.57.1/
-# Compatibilidad de estas dependencias validada por el resolvedor de pip.
+# Las tres dependencias de tokenización se validaron en el entorno de Fase 1C.
+# La validación integral del backend de entrenamiento queda pendiente para Colab.
 transformers==4.57.1
 tokenizers==0.22.2
 huggingface-hub==0.36.2
 
+# Trainer 4.57.1 exige accelerate>=0.26; versión publicada compatible con Python 3.12:
+# https://pypi.org/project/accelerate/1.10.1/
+accelerate==1.10.1
+# BETO original publica pytorch_model.bin: el cargador de Transformers 4.57.1
+# requiere torch>=2.6 para torch.load, incluso con weights_only=True.
+# No se fija una build CUDA: conservar/instalar primero la distribución adecuada
+# al runtime CPU/GPU de Colab: https://pytorch.org/get-started/locally/
+torch>=2.6,<3
+
 # No se necesita SentencePiece para el BertTokenizerFast de este repositorio.
-# PyTorch y accelerate se decidirán e instalarán en la futura fase de entrenamiento.
-# La instalación efectiva de PyTorch dependerá del entorno CPU/GPU (Colab);
-# este archivo no fija una distribución vinculada a CUDA local.
+# En Colab: comprobar primero torch/CUDA/GPU y usar el selector oficial si falta
+# una build compatible; después instalar este archivo. Registrar las versiones
+# efectivas con detect_runtime(). Aquí no se instalan dependencias al importar.
+# No hacen falta datasets ni evaluate: Dataset map y métricas sklearn de Fase 0.
 # nbformat se utilizó únicamente como herramienta de validación del notebook.
