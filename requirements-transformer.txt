@@ -1,0 +1,12 @@
+# Fase 1C: tokenizer de BETO; instalar junto al entorno existente de Fase 0.
+# Python 3.12 compatible: https://pypi.org/project/transformers/4.57.1/
+# Compatibilidad de estas dependencias validada por el resolvedor de pip.
+transformers==4.57.1
+tokenizers==0.22.2
+huggingface-hub==0.36.2
+
+# No se necesita SentencePiece para el BertTokenizerFast de este repositorio.
+# PyTorch y accelerate se decidirán e instalarán en la futura fase de entrenamiento.
+# La instalación efectiva de PyTorch dependerá del entorno CPU/GPU (Colab);
+# este archivo no fija una distribución vinculada a CUDA local.
+# nbformat se utilizó únicamente como herramienta de validación del notebook.

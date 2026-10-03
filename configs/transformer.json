@@ -1,0 +1,53 @@
+{
+  "checkpoints_dir": "models/transformer/",
+  "effective_batch_size": 16,
+  "evaluation_strategy": "epoch",
+  "gradient_accumulation_steps": null,
+  "label_mapping": {
+    "Negativo": 0,
+    "Positivo": 1
+  },
+  "learning_rates": [
+    1e-05,
+    2e-05,
+    3e-05
+  ],
+  "max_epochs": 3,
+  "max_length": 128,
+  "max_length_rule": {
+    "candidates": [
+      64,
+      128,
+      256,
+      512
+    ],
+    "minimum_coverage": 0.99,
+    "split": "train"
+  },
+  "max_length_status": "selected_from_train_99_percent_coverage",
+  "model_id": "dccuchile/bert-base-spanish-wwm-cased",
+  "model_revision": "c4d86612f51b4f46759c8390d1798c2febe71b93",
+  "num_labels": 2,
+  "padding_strategy": "dynamic_per_batch_DataCollatorWithPadding",
+  "physical_batch_size": null,
+  "precision": null,
+  "primary_metric": "f1_macro",
+  "results_dir": "results/transformer/",
+  "seed": 42,
+  "selection_rule": {
+    "f1_macro_tie_decimals": 4,
+    "order": [
+      "f1_macro_desc",
+      "accuracy_desc",
+      "learning_rate_asc",
+      "epoch_asc"
+    ],
+    "partition": "validation"
+  },
+  "target_column": "sentimiento_id",
+  "task": "binary_sequence_classification",
+  "test_policy": "reserved_for_common_final_phase_no_development_evaluation",
+  "text_column": "comentario_limpio",
+  "training_device": null,
+  "weight_decay": 0.01
+}
