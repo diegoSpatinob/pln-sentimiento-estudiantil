@@ -9,4 +9,7 @@ joblib==1.6.0
 # Utilizada para consultar y descargar el dataset desde Zenodo;
 # la versión exacta no quedó registrada en la celda 1.4
 requests>=2.31,<3
+# Ejecución secuencial de las celdas y tablas Styler del notebook
+ipython>=8,<10
+Jinja2>=3.1,<4
 # Jupyter es opcional si se utiliza Google Colab
