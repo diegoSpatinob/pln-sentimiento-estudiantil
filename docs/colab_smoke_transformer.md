@@ -5,8 +5,8 @@ en celdas y ejecutarlos en orden. Delega todo el modelado en `scripts/transforme
 no ejecuta el notebook de Diego, no verifica `baseline_C1.joblib`, no reconstruye
 limpieza/split y no lanza T1/T2/T3. No usar «Ejecutar todo» antes de revisar el entorno.
 
-El pipeline revisado corresponde al commit
-`1cf7212fc962fe8035bf3d3f68a2728ff9dec349` (Fase 2A fusionada en main).
+El pipeline revisado y probado en la ejecución final de Fase 2B corresponde al commit
+`c6ef8a4ad3b5d4b9c591297c33eef607b6d240af`.
 Esta guía local no necesita estar publicada para copiar sus celdas. Una revisión
 posterior debe fijarse y revisarse explícitamente; no se actualiza el código a un
 HEAD móvil durante una ejecución.
@@ -16,10 +16,53 @@ fp16, batch físico 16 y acumulación 1**. Las particiones de Fase 0 pasaron sus
 verificaciones. No hubo CUDA OOM: se cargó BETO, se ejecutaron dos pasos de
 optimización con backward y se evaluaron los 16 registros de validation con
 cálculo de métricas. El smoke falló únicamente en la comprobación final de
-save/reload; no debe registrarse como un smoke completamente verificado.
-La corrección técnica descrita más abajo todavía requiere repetir el smoke en Colab.
+save/reload por comparar forwards bajo condiciones AMP distintas; ese primer
+intento no debe registrarse como un smoke completamente verificado. Se corrigió
+la comprobación técnica sin cambiar hiperparámetros metodológicos. La ejecución
+final posterior verificó correctamente la recarga, como se registra a continuación.
 
-El stack observado en esa ejecución fue exactamente el siguiente; es un registro
+## Resultado final real de Fase 2B — NO OFICIAL
+
+El smoke final pasó las comprobaciones técnicas de actualización de parámetros,
+guardado y recarga, incluida la igualdad exacta del `state_dict`. Es **NO OFICIAL**:
+sus métricas de validation no se utilizan para seleccionar modelos,
+hiperparámetros, batch ni precisión, ni para comparar resultados con el baseline.
+Este resultado verifica la infraestructura; no corresponde a T1/T2/T3 ni a
+entrenamiento completo. Test no se utilizó predictivamente.
+
+| Campo | Resultado final real |
+| --- | --- |
+| Commit probado | `c6ef8a4ad3b5d4b9c591297c33eef607b6d240af` |
+| Run ID | `SMOKE_8b466ec8bf40` |
+| Registro técnico | `TECH_e84c3c45f78c` |
+| GPU | Tesla T4 |
+| PyTorch | 2.11.0+cu130 |
+| CUDA del runtime PyTorch | 13.0 |
+| Transformers | 4.57.1 |
+| Accelerate | 1.10.1 |
+| `precision` | `fp16` |
+| `physical_batch_size` | `16` |
+| `gradient_accumulation_steps` | `1` |
+| `learning_rate` | `2e-5` |
+| `train_records` | `32` |
+| `validation_records` | `16` |
+| `optimizer_steps` | `2` |
+| `parameter_update_verified` | `true` |
+| `save_reload_verified` | `true` |
+| `state_dict_verified` | `true` |
+| `test_used` | `false` |
+| CUDA OOM | No |
+| Fallback físico 8 / acumulación 2 | No se ejecutó |
+
+Las referencias a los artefactos de esta ejecución, según las rutas del pipeline,
+son `results/transformer/smoke/SMOKE_8b466ec8bf40/smoke_test_NO_OFICIAL.json`,
+`models/transformer/smoke/SMOKE_8b466ec8bf40/save_reload_diagnostics_NO_OFICIAL.json`
+y `results/transformer/colab/TECH_e84c3c45f78c/technical_record_NO_OFICIAL.json`.
+El batch 16 funcionó sin CUDA OOM; no se probó batch 8 ni se eligió batch mediante
+métricas. No se incluyen aquí valores de métricas de clasificación como resultados
+experimentales oficiales.
+
+El stack observado en la primera ejecución fue exactamente el siguiente; es un registro
 del entorno utilizado, no una instrucción para reemplazar el PyTorch funcional de
 una sesión futura:
 
@@ -90,7 +133,7 @@ import os, subprocess
 from pathlib import Path
 
 REPO = Path("/content/pln-sentimiento-estudiantil")
-REVIEWED_COMMIT = "1cf7212fc962fe8035bf3d3f68a2728ff9dec349"
+REVIEWED_COMMIT = "c6ef8a4ad3b5d4b9c591297c33eef607b6d240af"
 REPO_URL = "https://github.com/diegoSpatinob/pln-sentimiento-estudiantil.git"
 if not REPO.exists():
     subprocess.run(["git", "clone", REPO_URL, str(REPO)], check=True)
@@ -482,7 +525,7 @@ Un error de descarga, dependencias, recarga o métrica no autoriza el fallback.
 
 ### Comprobación técnica de save/reload y corrección del wrapper AMP
 
-En la ejecución real, la comparación anterior con `torch.allclose(..., rtol=1e-4,
+En la primera ejecución real, la comparación anterior con `torch.allclose(..., rtol=1e-4,
 atol=1e-4)` falló con `La recarga técnica no conserva resultados de validation`.
 Ambos modelos estaban en `eval()` y recibían el mismo batch en el mismo dispositivo.
 La asimetría estaba en el forward: el modelo de Trainer conservaba el wrapper AMP
@@ -496,13 +539,17 @@ La comprobación corregida de `scripts/transformer.py`:
 - Compara exactamente claves, formas, tipos y valores del `state_dict`, incluidos
   buffers; no aplica tolerancia a los pesos.
 - Mide `max_abs_diff` y `mean_abs_diff` de logits antes de retirar el wrapper.
+- Para calcular diferencias y `allclose`, normaliza copias de ambos logits a
+  float32, conservando los dtypes originales en el diagnóstico y sin modificar
+  los outputs. Así también puede diagnosticar BF16 frente a Float sin abortar
+  por una incompatibilidad de dtype.
 - Utiliza `accelerator.unwrap_model(..., keep_fp32_wrapper=False,
   keep_torch_compile=False)` y repite ambos forwards finales en fp32, `eval()`,
   sobre los mismos tensores y dispositivo, con autocast desactivado.
 - Mantiene `rtol=1e-4` y `atol=1e-4`. No amplía la tolerancia para conseguir éxito.
 - Solo establece `save_reload_verified=true` si el estado coincide exactamente,
-  los estados flotantes son fp32, ambas pérdidas y logits son finitos y la
-  comparación de logits bajo condiciones equivalentes pasa.
+  los estados flotantes y ambos outputs finales originales son fp32, ambas
+  pérdidas y logits son finitos y la comparación bajo condiciones equivalentes pasa.
 
 La precisión fp32 corresponde **solo a la verificación final de serialización**;
 entrenamiento y evaluación mantienen la precisión técnica elegida, fp16 en esta
@@ -515,8 +562,9 @@ Incluye las diferencias agregadas antes y después de retirar el wrapper, tipos,
 comprobación del estado, tolerancias y flag de verificación. Se conserva también
 si la comprobación falla; no contiene logits crudos ni predicciones. En caso de
 éxito también queda incorporado al resultado `smoke_test_NO_OFICIAL.json`.
-No disponemos de los logits de la ejecución fallida para cuantificar su diferencia
-retrospectivamente: la nueva ejecución medirá esos valores, sin inventar magnitudes.
+No disponemos de los logits de la primera ejecución fallida para cuantificar su
+diferencia retrospectivamente. La ejecución final conserva el diagnóstico agregado;
+esta guía no inventa magnitudes numéricas que no se hayan aportado.
 
 El fallo anterior deja el manifiesto, el checkpoint y `smoke_saved_model` en su
 directorio de modelos, pero no crea el resultado final de éxito. Conservar los
@@ -524,13 +572,11 @@ artefactos parciales para trazabilidad; una nueva ejecución usa un nuevo
 `SMOKE_<uuid>` y BETO original, sin reanudar ese checkpoint. No probar batch 8:
 el intento real con batch 16 no tuvo OOM.
 
-Si la sesión sigue activa, basta actualizar el script y repetir **únicamente el
-smoke**, con el mismo comando, learning rate, batch y precisión. El commit fijado
-al comienzo corresponde a Fase 2A y no incorpora esta corrección local: mientras
-no esté publicada, `git pull` no la proporciona. Transferir el script corregido,
-registrar su SHA-256 junto al commit base y evitar sobrescribirlo con un checkout
-del commit antiguo. No atribuir el código corregido únicamente al SHA base. Para
-una ejecución futura desde Git, fijar una revisión revisada que incluya la corrección.
+La ejecución final `SMOKE_8b466ec8bf40` ya verificó esta corrección en Colab con el
+commit probado indicado al comienzo. Para reproducirla, utilizar ese mismo commit,
+que incluye las correcciones de AMP y de comparación entre dtypes, y ejecutar
+únicamente el smoke con el protocolo fijado. Una reproducción tendrá IDs nuevos;
+los identificadores de esta guía corresponden al registro histórico final.
 
 ## 7. Descargar el registro técnico pequeño
 
@@ -584,6 +630,8 @@ todos los conflictos son ajenos al experimento según el criterio de la sección
 Si hay un conflicto relevante o incierto, conservar el diagnóstico y detenerse;
 no sustituir versiones ni modificar el protocolo automáticamente.
 
-Esta guía registra una ejecución real que llegó a entrenamiento y evaluación,
-pero falló en save/reload. No afirma que el smoke corregido haya pasado en Colab.
+Esta guía registra el primer intento fallido y el **smoke final real verificado
+en Colab**, con actualización de parámetros, save/reload y `state_dict` comprobados.
+Fase 2B queda validada técnicamente; sus métricas siguen siendo NO OFICIALES y no
+habilitan selección de hiperparámetros ni ejecución automática de T1/T2/T3.
 No ejecutar experimentos oficiales ni realizar commits desde Colab en esta fase.
