@@ -11,6 +11,7 @@ import io
 import json
 import platform
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import version
@@ -183,8 +184,9 @@ def verify_transformer_checkpoint(checkpoint_dir, base_dir=ROOT):
             "selection_source": "winner_frozen_before_test_by_user_and_validation"}
 
 
-def load_transformer_for_inference(checkpoint_dir):
+def load_transformer_for_inference(checkpoint_dir, device="cuda"):
     """Una carga local del checkpoint; rechaza pesos faltantes o incompatibles."""
+    require(device in {"cpu", "cuda"}, "Dispositivo final debe ser cpu o cuda.")
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
     model, info = AutoModelForSequenceClassification.from_pretrained(
@@ -197,22 +199,25 @@ def load_transformer_for_inference(checkpoint_dir):
                                                trust_remote_code=False, use_fast=True)
     require(model.config.num_labels == 2, "El modelo final debe tener dos clases.")
     model.requires_grad_(False)
-    model.to("cuda").eval()
+    model.to(device).eval()
     return model, tokenizer
 
 
-def predict_transformer_test(model, tokenizer, partition, confirm_final_test=False):
-    """Una pasada ordenada por test, batch 16/max_length 128/padding dinámico/fp16."""
+def predict_transformer_test(model, tokenizer, partition, confirm_final_test=False, device="cuda"):
+    """Una pasada: batch 16/max_length 128; CUDA fp16, CPU sin autocast."""
     require_final_mode(confirm_final_test)
+    require(device in {"cpu", "cuda"}, "Dispositivo final debe ser cpu o cuda.")
     import torch
 
     guard_final_partition(partition)
     predictions = []
     model.eval()
-    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.float16):
+    precision_context = (torch.autocast(device_type="cuda", dtype=torch.float16)
+                         if device == "cuda" else nullcontext())
+    with torch.inference_mode(), precision_context:
         for start in range(0, len(partition.texts), 16):
             inputs = tokenizer(list(partition.texts[start:start + 16]), max_length=128,
-                               truncation=True, padding=True, return_tensors="pt").to("cuda")
+                               truncation=True, padding=True, return_tensors="pt").to(device)
             require(set(inputs).issubset({"input_ids", "attention_mask", "token_type_ids"}),
                     "Campos ajenos al predictor textual.")
             logits = model(**inputs).logits.detach().float().cpu().numpy()
@@ -286,19 +291,24 @@ def evaluate_once(model_key, partition, predict, model_metadata, runtime, base_d
         raise
 
 
-def run_transformer(checkpoint_dir, confirm_final_test=False, base_dir=ROOT, split="test"):
+def run_transformer(checkpoint_dir, confirm_final_test=False, base_dir=ROOT, split="test", device="cuda"):
     require_final_mode(confirm_final_test, split)
+    require(device in {"cpu", "cuda"}, "Dispositivo final debe ser cpu o cuda.")
     ensure_new_evaluation(output_path("transformer_T2", base_dir))
     provenance = verify_transformer_checkpoint(checkpoint_dir, base_dir)
-    runtime = development.detect_runtime("cuda")
-    require(runtime["torch_available"] and runtime["device"] == "cuda"
-            and len(runtime["gpu"]) == 1 and runtime["precision_support"]["fp16"]
-            and version("transformers") == "4.57.1", "Entorno CUDA/fp16/Transformers 4.57.1 requerido.")
-    model, tokenizer = load_transformer_for_inference(provenance["checkpoint_path"])
+    runtime = development.detect_runtime(device)
+    precision = "fp16" if device == "cuda" else "fp32"
+    require(runtime["torch_available"] and runtime["device"] == device
+            and runtime["precision_support"][precision] and version("transformers") == "4.57.1",
+            "PyTorch/Transformers 4.57.1 y precisión del dispositivo solicitados requeridos.")
+    if device == "cuda":
+        require(len(runtime["gpu"]) == 1, "CUDA final requiere una única GPU.")
+    model, tokenizer = load_transformer_for_inference(provenance["checkpoint_path"], device=device)
     partition = load_final_test(base_dir, split)
-    runtime = {**runtime, "precision": "fp16", "batch_size": 16, "max_length": 128}
+    runtime = {**runtime, "precision": precision, "batch_size": 16, "max_length": 128}
     return evaluate_once("transformer_T2", partition,
-                         lambda: predict_transformer_test(model, tokenizer, partition, confirm_final_test=True),
+                         lambda: predict_transformer_test(model, tokenizer, partition,
+                                                          confirm_final_test=True, device=device),
                          provenance, runtime, base_dir, confirm_final_test=True)
 
 
@@ -390,6 +400,7 @@ def main(argv=None):
             command.add_argument("--split", choices=["test"], default="test")
         if operation == "transformer":
             command.add_argument("--checkpoint", type=Path, required=True)
+            command.add_argument("--device", choices=["cpu", "cuda"], default="cuda")
         if operation == "compare":
             command.add_argument("--transformer-result", type=Path)
             command.add_argument("--baseline-result", type=Path)
@@ -397,7 +408,7 @@ def main(argv=None):
     if args.operation != "compare" and not args.confirm_final_test:
         parser.error("La predicción sobre test requiere --confirm-final-test.")
     if args.operation == "transformer":
-        result = run_transformer(args.checkpoint, args.confirm_final_test, args.base_dir, args.split)
+        result = run_transformer(args.checkpoint, args.confirm_final_test, args.base_dir, args.split, args.device)
     elif args.operation == "baseline":
         result = run_baseline(args.confirm_final_test, args.base_dir, args.split)
     else:

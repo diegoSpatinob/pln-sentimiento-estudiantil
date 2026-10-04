@@ -269,7 +269,23 @@ class InferenceTests(unittest.TestCase):
         loader.assert_called_once_with("UNIT_TEST_SELECTED_CHECKPOINT", local_files_only=True,
                                        trust_remote_code=False, use_safetensors=True, output_loading_info=True)
         model.requires_grad_.assert_called_once_with(False)
+        model.to.assert_called_once_with("cuda")
         model.eval.assert_called_once()
+        model.train.assert_not_called()
+
+    def test_cpu_load_moves_only_selected_model_to_cpu(self):
+        model = Mock(config=SimpleNamespace(num_labels=2))
+        model.to.return_value = model
+        loader = Mock(return_value=(model, {}))
+        module = SimpleNamespace(AutoModelForSequenceClassification=SimpleNamespace(from_pretrained=loader),
+                                 AutoTokenizer=SimpleNamespace(from_pretrained=Mock()))
+        with patch.dict(sys.modules, {"transformers": module}):
+            f.load_transformer_for_inference("UNIT_TEST_SELECTED_CHECKPOINT", device="cpu")
+        loader.assert_called_once_with("UNIT_TEST_SELECTED_CHECKPOINT", local_files_only=True,
+                                       trust_remote_code=False, use_safetensors=True, output_loading_info=True)
+        model.to.assert_called_once_with("cpu")
+        model.eval.assert_called_once()
+        model.requires_grad_.assert_called_once_with(False)
         model.train.assert_not_called()
 
     def test_incomplete_weights_cannot_initialize_new_head(self):
@@ -282,6 +298,12 @@ class InferenceTests(unittest.TestCase):
         tokenizer.assert_not_called()
 
     def test_one_pass_no_gradients_text_only_and_dynamic_batches(self):
+        self.check_one_pass("cuda")
+
+    def test_cpu_one_pass_inference_mode_cpu_tensors_without_autocast(self):
+        self.check_one_pass("cpu")
+
+    def check_one_pass(self, device):
         partition = synthetic_partition(17)
         state = {"inference_active": False, "seen": [], "forwards": 0}
 
@@ -297,8 +319,8 @@ class InferenceTests(unittest.TestCase):
             yield
 
         class Batch(dict):
-            def to(batch, device):
-                self.assertEqual(device, "cuda")
+            def to(batch, destination):
+                self.assertEqual(destination, device)
                 return batch
 
         def tokenize(texts, **kwargs):
@@ -316,9 +338,12 @@ class InferenceTests(unittest.TestCase):
             return SimpleNamespace(logits=logits)
 
         model = Mock(side_effect=forward)
-        torch = SimpleNamespace(inference_mode=inference, autocast=autocast, float16="UNIT_TEST_FP16")
+        cpu_autocast = Mock(side_effect=AssertionError("CPU must not use autocast"))
+        torch = (SimpleNamespace(inference_mode=inference, autocast=autocast, float16="UNIT_TEST_FP16")
+                 if device == "cuda" else SimpleNamespace(inference_mode=inference, autocast=cpu_autocast))
         with patch.dict(sys.modules, {"torch": torch}):
-            predictions = f.predict_transformer_test(model, tokenize, partition, True)
+            predictions = f.predict_transformer_test(model, tokenize, partition, True, device=device)
+        cpu_autocast.assert_not_called()
         self.assertEqual(state["seen"], list(partition.texts))
         self.assertEqual(state["forwards"], 2)
         self.assertEqual(predictions.tolist(), [0] * 17)
@@ -367,10 +392,35 @@ class FinalOperationsTests(unittest.TestCase):
              patch.object(f, "load_final_test", return_value=self.partition) as load_test, \
              patch.object(f, "predict_transformer_test", return_value=self.partition.labels) as predict:
             result = f.run_transformer("UNIT_TEST_EXPLICIT_CP", True, self.base)
-        load_model.assert_called_once_with("UNIT_TEST_CP")
+        load_model.assert_called_once_with("UNIT_TEST_CP", device="cuda")
         load_test.assert_called_once_with(self.base, "test")
-        predict.assert_called_once_with(model, tokenizer, self.partition, confirm_final_test=True)
+        predict.assert_called_once_with(model, tokenizer, self.partition, confirm_final_test=True, device="cuda")
         self.assertEqual(result["metrics"], f.classification_metrics(self.partition.labels, self.partition.labels)["metrics"])
+        self.assertEqual(result["runtime"]["device"], "cuda")
+        self.assertEqual(result["runtime"]["precision"], "fp16")
+
+    def test_cpu_final_operation_records_device_fp32_and_frozen_winner(self):
+        runtime = {"torch_available": True, "device": "cpu", "gpu": [], "precision_support": {"fp32": True}}
+        model, tokenizer = Mock(), Mock()
+        with patch.object(f, "verify_transformer_checkpoint", return_value={**transformer_provenance(), "checkpoint_path": "UNIT_TEST_CP"}), \
+             patch.object(f.development, "detect_runtime", return_value=runtime) as detect, \
+             patch.object(f, "version", return_value="4.57.1"), \
+             patch.object(f, "load_transformer_for_inference", return_value=(model, tokenizer)) as load_model, \
+             patch.object(f, "load_final_test", return_value=self.partition) as load_test, \
+             patch.object(f, "predict_transformer_test", return_value=self.partition.labels) as predict:
+            result = f.run_transformer("UNIT_TEST_EXPLICIT_CP", True, self.base, device="cpu")
+        detect.assert_called_once_with("cpu")
+        load_model.assert_called_once_with("UNIT_TEST_CP", device="cpu")
+        load_test.assert_called_once_with(self.base, "test")
+        predict.assert_called_once_with(model, tokenizer, self.partition, confirm_final_test=True, device="cpu")
+        saved = f.read_json(f.output_path("transformer_T2", self.base))
+        self.assertEqual(saved, result)
+        self.assertEqual(saved["runtime"]["device"], "cpu")
+        self.assertEqual(saved["runtime"]["precision"], "fp32")
+        for key, value in f.WINNER.items():
+            self.assertEqual(saved["model"][key], value)
+        self.assertFalse(saved["training_performed"])
+        self.assertFalse(saved["reselection_performed"])
 
     def test_rerun_cannot_predict_again_or_overwrite(self):
         self.evaluate("baseline_C1", self.partition.labels)
@@ -448,6 +498,8 @@ class CLITests(unittest.TestCase):
         with patch.object(f, "run_transformer") as transformer, patch.object(f, "run_baseline") as baseline, \
              redirect_stderr(io.StringIO()):
             for argv in (["baseline"], ["transformer", "--checkpoint", "UNIT_TEST_CP"],
+                         ["transformer", "--checkpoint", "UNIT_TEST_CP", "--device", "cpu"],
+                         ["transformer", "--checkpoint", "UNIT_TEST_CP", "--confirm-final-test", "--device", "auto"],
                          ["baseline", "--confirm-final-test", "--split", "train"],
                          ["transformer", "--checkpoint", "UNIT_TEST_CP", "--confirm-final-test", "--split", "validation"],
                          ["baseline", "--confirm-final-t"], ["baseline", "--confirm-final-test", "--learning-rate", "1e-5"]):
@@ -461,7 +513,10 @@ class CLITests(unittest.TestCase):
              patch.object(f, "run_baseline", return_value={}) as baseline, \
              patch.object(f, "compare_results", return_value={}) as compare, redirect_stdout(io.StringIO()):
             f.main(["transformer", "--checkpoint", "UNIT_TEST_CP", "--confirm-final-test"])
-            transformer.assert_called_once_with(Path("UNIT_TEST_CP"), True, f.ROOT, "test")
+            transformer.assert_called_once_with(Path("UNIT_TEST_CP"), True, f.ROOT, "test", "cuda")
+            transformer.reset_mock()
+            f.main(["transformer", "--checkpoint", "UNIT_TEST_CP", "--confirm-final-test", "--device", "cpu"])
+            transformer.assert_called_once_with(Path("UNIT_TEST_CP"), True, f.ROOT, "test", "cpu")
             f.main(["baseline", "--confirm-final-test"])
             baseline.assert_called_once_with(True, f.ROOT, "test")
             f.main(["compare"])
