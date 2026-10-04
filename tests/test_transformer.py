@@ -27,6 +27,14 @@ def cpu_runtime():
             "precision_support": {"fp32": True, "fp16": False, "bf16": False}}
 
 
+def cuda_runtime():
+    return {"torch_available": True, "device": "cuda", "gpu": [{}],
+            "precision_support": {"fp32": True, "fp16": True, "bf16": False}}
+
+
+RUN_ID = "RUN_" + "1" * 32
+
+
 class ConfigurationAndMetricsTests(unittest.TestCase):
     def setUp(self):
         self.config = t.load_config()
@@ -63,19 +71,18 @@ class ConfigurationAndMetricsTests(unittest.TestCase):
             plans = []
             for experiment, learning_rate in zip(("T1", "T2", "T3"), self.config["learning_rates"]):
                 plans.append(t.training_argument_values(self.config, experiment, learning_rate,
-                                                        16, "fp32", cpu_runtime()))
+                                                        16, "fp16", cuda_runtime(), run_id=RUN_ID))
             self.assertEqual(len({p["output_dir"] for p in plans}), 3)
-            for physical, accumulation in ((16, 1), (8, 2)):
-                plan = t.training_argument_values(self.config, "T1", 1e-5, physical,
-                                                 "fp32", cpu_runtime())
-                self.assertEqual(plan["gradient_accumulation_steps"], accumulation)
-                self.assertEqual(physical * accumulation, 16)
+            for plan in plans:
+                self.assertEqual(plan["gradient_accumulation_steps"], 1)
+                self.assertEqual(plan["per_device_train_batch_size"], 16)
                 self.assertEqual(plan["eval_strategy"], "epoch")
                 self.assertEqual(plan["save_strategy"], "epoch")
-                self.assertTrue(plan["load_best_model_at_end"])
-                self.assertEqual(plan["metric_for_best_model"], "f1_macro")
-                self.assertTrue(plan["greater_is_better"])
-                self.assertEqual(plan["save_total_limit"], 2)
+                self.assertFalse(plan["load_best_model_at_end"])
+                self.assertIsNone(plan["metric_for_best_model"])
+                self.assertIsNone(plan["greater_is_better"])
+                self.assertEqual(plan["save_total_limit"], 3)
+                self.assertEqual(plan["num_train_epochs"], 3)
                 self.assertNotIn("evaluation_strategy", plan)
             smoke = t.training_argument_values(self.config, "SMOKE_contract", 1e-5,
                                               8, "fp32", cpu_runtime(), smoke=True)
@@ -157,7 +164,8 @@ class ConfigurationAndMetricsTests(unittest.TestCase):
         cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "TrainingArguments")
         fields = {n.target.id for n in cls.body if isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name)}
         with patch.dict(os.environ, {"WORLD_SIZE": "1"}):
-            plan = t.training_argument_values(self.config, "T1", 1e-5, 16, "fp32", cpu_runtime())
+            plan = t.training_argument_values(self.config, "T1", 1e-5, 16, "fp16", cuda_runtime(),
+                                              run_id=RUN_ID)
         self.assertTrue(set(plan).issubset(fields), set(plan) - fields)
         tree = ast.parse((root / "trainer.py").read_text())
         cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Trainer")
@@ -217,6 +225,24 @@ class DataPolicyTests(unittest.TestCase):
             self.assertEqual(len(dataset[0]["input_ids"]), 3)
             self.assertIs(t.guard_development_dataset(dataset, name), dataset)
 
+    def test_official_preparation_uses_full_train_validation_only(self):
+        previous_seen = list(self.seen)
+        self.seen.clear()
+        try:
+            # El spy no tokeniza con BETO ni entrena; registra únicamente las
+            # entradas autorizadas y devuelve IDs sintéticos para cada texto.
+            datasets = t.prepare_training_datasets(self.spy, self.config, smoke=False)
+            expected = [text for name in ("train", "validation")
+                        for text in self.frames[name]["comentario_limpio"]]
+            self.assertEqual(self.seen, expected)
+            self.assertEqual({name: len(data) for name, data in datasets.items()},
+                             {"train": 16186, "validation": 3468})
+            self.assertTrue(all(not data.smoke for data in datasets.values()))
+            for name, data in datasets.items():
+                self.assertIs(t.guard_development_dataset(data, name), data)
+        finally:
+            self.seen[:] = previous_seen
+
     def test_test_external_and_renamed_datasets_rejected(self):
         with self.assertRaises(ValueError):
             replace(self.datasets["validation"], split="test")
@@ -231,7 +257,8 @@ class DataPolicyTests(unittest.TestCase):
         class TrainerDouble:
             def __init__(self, **kwargs):
                 self.__dict__.update(kwargs)
-                self.state = SimpleNamespace(best_metric=None, best_global_step=None, global_step=1)
+                self.state = SimpleNamespace(best_metric=None, best_global_step=None, global_step=1,
+                                             epoch=1)
 
             def get_eval_dataloader(self, dataset):
                 return dataset
@@ -242,13 +269,16 @@ class DataPolicyTests(unittest.TestCase):
         with TemporaryDirectory(dir="/tmp") as tmp:
             trainer = trainer_type(train_dataset=self.datasets["train"],
                                    eval_dataset=self.datasets["validation"],
-                                   args=SimpleNamespace(output_dir=tmp))
+                                   args=SimpleNamespace(output_dir=tmp, learning_rate=1e-5,
+                                                        metric_for_best_model="f1_macro"))
             for entrypoint in (trainer.evaluate, trainer.predict, trainer.get_eval_dataloader,
                                trainer.get_test_dataloader):
                 with self.assertRaises(ValueError):
                     entrypoint(SimpleNamespace(split="test"))
             with self.assertRaises(ValueError):
                 trainer.train(resume_from_checkpoint="models/transformer/T1/checkpoint-1")
+            with self.assertRaises(ValueError):
+                trainer.train(model_path="models/transformer/T1/checkpoint-1")
             trainer.train_dataset = self.datasets["validation"]
             with self.assertRaises(ValueError):
                 trainer.get_train_dataloader()
