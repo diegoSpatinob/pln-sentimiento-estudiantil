@@ -678,7 +678,8 @@ def verify_smoke_save_reload(trainer, reloaded, batch, diagnostics_path):
     """Verifica serialización; no cambia la precisión del entrenamiento/evaluación.
 
     Invocar al final del smoke con su batch de validation. Accelerate envuelve
-    forward con autocast aunque eval() esté activo y devuelve logits en fp32.
+    forward con autocast aunque eval() esté activo; algunos contenedores de
+    salida conservan logits BF16/fp16 en lugar de recibir la conversión a fp32.
     Se mide esa comparación previa y después se retira el wrapper mediante la
     API pública: ambos forwards finales usan fp32, eval y los mismos tensores.
     La retirada es definitiva en este Trainer, que no se reutiliza tras el smoke.
@@ -711,14 +712,19 @@ def verify_smoke_save_reload(trainer, reloaded, batch, diagnostics_path):
     diagnostics_path.write_bytes(_json_bytes(diagnostics))
 
     def compare_logits(original, restored):
-        finite = bool(torch.isfinite(original).all().item()
-                      and torch.isfinite(restored).all().item())
-        difference = (original.detach().double() - restored.detach().double()).abs() if finite else None
+        # allclose exige dtypes compatibles. Comparar copias fp32 sin alterar
+        # los outputs AMP originales; conservar sus dtypes en el diagnóstico.
+        original_fp32 = original.detach().to(dtype=torch.float32, copy=True)
+        restored_fp32 = restored.detach().to(dtype=torch.float32, copy=True)
+        finite = bool(torch.isfinite(original_fp32).all().item()
+                      and torch.isfinite(restored_fp32).all().item())
+        difference = (original_fp32 - restored_fp32).abs() if finite else None
         return {"max_abs_diff": difference.max().item() if finite else None,
                 "mean_abs_diff": difference.mean().item() if finite else None,
                 "finite": finite, "original_dtype": str(original.dtype),
                 "reloaded_dtype": str(restored.dtype),
-                "allclose": bool(torch.allclose(original, restored, rtol=1e-4, atol=1e-4))}
+                "comparison_dtype": "torch.float32",
+                "allclose": bool(torch.allclose(original_fp32, restored_fp32, rtol=1e-4, atol=1e-4))}
 
     # Diagnóstico del fallo anterior: el wrapper interno puede activar autocast
     # incluso dentro de este contexto externo con autocast desactivado.
@@ -740,6 +746,8 @@ def verify_smoke_save_reload(trainer, reloaded, batch, diagnostics_path):
     diagnostics["save_reload_verified"] = bool(
         diagnostics["state_dict_verified"] and floating_dtypes == ["torch.float32"]
         and diagnostics["finite_losses"] and diagnostics["equivalent_fp32_forwards"]["finite"]
+        and diagnostics["equivalent_fp32_forwards"]["original_dtype"]
+            == diagnostics["equivalent_fp32_forwards"]["reloaded_dtype"] == "torch.float32"
         and diagnostics["equivalent_fp32_forwards"]["allclose"])
     # Se conserva evidencia también cuando la comprobación falla.
     diagnostics_path.write_bytes(_json_bytes(diagnostics))
