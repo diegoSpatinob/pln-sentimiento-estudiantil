@@ -674,6 +674,81 @@ def build_trainer(config, tokenizer, datasets, experiment_id, learning_rate,
     return trainer
 
 
+def verify_smoke_save_reload(trainer, reloaded, batch, diagnostics_path):
+    """Verifica serialización; no cambia la precisión del entrenamiento/evaluación.
+
+    Invocar al final del smoke con su batch de validation. Accelerate envuelve
+    forward con autocast aunque eval() esté activo y devuelve logits en fp32.
+    Se mide esa comparación previa y después se retira el wrapper mediante la
+    API pública: ambos forwards finales usan fp32, eval y los mismos tensores.
+    La retirada es definitiva en este Trainer, que no se reutiliza tras el smoke.
+    Solo se persisten diferencias agregadas, nunca logits ni predicciones.
+    """
+    import torch
+
+    diagnostics_path = Path(diagnostics_path)
+    diagnostics = {"purpose": "SMOKE_TEST_NO_OFICIAL", "save_reload_verified": False,
+                   "verification_precision": "fp32", "device": str(trainer.args.device),
+                   "rtol": 1e-4, "atol": 1e-4}
+    diagnostics_path.write_bytes(_json_bytes(diagnostics))
+    trainer.model.to(trainer.args.device).eval()
+    reloaded.to(trainer.args.device).eval()
+    batch = {key: value.to(trainer.args.device) for key, value in batch.items()}
+
+    original_state, reloaded_state = trainer.model.state_dict(), reloaded.state_dict()
+    different_keys = sorted(set(original_state) ^ set(reloaded_state))
+    unequal_tensors = [key for key in sorted(set(original_state) & set(reloaded_state))
+                       if original_state[key].shape != reloaded_state[key].shape
+                       or original_state[key].dtype != reloaded_state[key].dtype
+                       or not torch.equal(original_state[key].detach().cpu(),
+                                          reloaded_state[key].detach().cpu())]
+    floating_dtypes = sorted({str(value.dtype) for state in (original_state, reloaded_state)
+                             for value in state.values() if value.is_floating_point()})
+    diagnostics.update(state_dict_verified=not different_keys and not unequal_tensors,
+                       state_dict_tensor_count=len(original_state),
+                       different_state_keys=different_keys, unequal_state_tensors=unequal_tensors,
+                       floating_state_dtypes=floating_dtypes)
+    diagnostics_path.write_bytes(_json_bytes(diagnostics))
+
+    def compare_logits(original, restored):
+        finite = bool(torch.isfinite(original).all().item()
+                      and torch.isfinite(restored).all().item())
+        difference = (original.detach().double() - restored.detach().double()).abs() if finite else None
+        return {"max_abs_diff": difference.max().item() if finite else None,
+                "mean_abs_diff": difference.mean().item() if finite else None,
+                "finite": finite, "original_dtype": str(original.dtype),
+                "reloaded_dtype": str(restored.dtype),
+                "allclose": bool(torch.allclose(original, restored, rtol=1e-4, atol=1e-4))}
+
+    # Diagnóstico del fallo anterior: el wrapper interno puede activar autocast
+    # incluso dentro de este contexto externo con autocast desactivado.
+    with torch.no_grad(), torch.autocast(device_type=trainer.args.device.type, enabled=False):
+        wrapped_output = trainer.model(**batch)
+        reloaded_output = reloaded(**batch)
+    diagnostics["before_removing_amp_wrapper"] = compare_logits(wrapped_output.logits,
+                                                                reloaded_output.logits)
+    original = trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper=False,
+                                               keep_torch_compile=False)
+    original.to(trainer.args.device).eval()
+    with torch.no_grad(), torch.autocast(device_type=trainer.args.device.type, enabled=False):
+        original_output = original(**batch)
+        reloaded_output = reloaded(**batch)
+    diagnostics["equivalent_fp32_forwards"] = compare_logits(original_output.logits,
+                                                             reloaded_output.logits)
+    diagnostics["finite_losses"] = bool(torch.isfinite(original_output.loss).item()
+                                         and torch.isfinite(reloaded_output.loss).item())
+    diagnostics["save_reload_verified"] = bool(
+        diagnostics["state_dict_verified"] and floating_dtypes == ["torch.float32"]
+        and diagnostics["finite_losses"] and diagnostics["equivalent_fp32_forwards"]["finite"]
+        and diagnostics["equivalent_fp32_forwards"]["allclose"])
+    # Se conserva evidencia también cuando la comprobación falla.
+    diagnostics_path.write_bytes(_json_bytes(diagnostics))
+    print("SMOKE_SAVE_RELOAD_DIAGNOSTICS " + json.dumps(diagnostics, allow_nan=False), flush=True)
+    _require(diagnostics["save_reload_verified"],
+             f"La recarga técnica no conserva el estado/forward de validation; ver {diagnostics_path}.")
+    return diagnostics
+
+
 def run_smoke_test(learning_rate, physical_batch_size, precision, device="auto",
                    base_dir=ROOT, run_id=None, local_files_only=False):
     """Único ejecutor de esta fase: 32 train/16 validation, 2 pasos, NO OFICIAL.
@@ -715,23 +790,17 @@ def run_smoke_test(learning_rate, physical_batch_size, precision, device="auto",
     # Única excepción a la inicialización original: probar la recarga del smoke
     # guardado. Este modelo se descarta y jamás inicializa un experimento oficial.
     reloaded = AutoModelForSequenceClassification.from_pretrained(str(saved), local_files_only=True)
-    reloaded.to(trainer.args.device)
-    reloaded.eval()
-    trainer.model.eval()
     sample = [datasets["validation"][i] for i in range(min(2, len(datasets["validation"])))]
-    batch = {key: value.to(trainer.args.device) for key, value in trainer.data_collator(sample).items()}
-    with torch.no_grad():
-        original_output = trainer.model(**batch)
-        reloaded_output = reloaded(**batch)
-    _require(torch.isfinite(reloaded_output.loss).item()
-             and torch.allclose(original_output.logits, reloaded_output.logits, rtol=1e-4, atol=1e-4),
-             "La recarga técnica no conserva resultados de validation.")
+    reload_diagnostics = verify_smoke_save_reload(
+        trainer, reloaded, trainer.data_collator(sample),
+        Path(trainer.args.output_dir) / "save_reload_diagnostics_NO_OFICIAL.json")
     result = {"purpose": "SMOKE_TEST_NO_OFICIAL", "official": False,
               "not_for_comparison_or_hyperparameter_selection": True,
               "run_id": run_id, "train_records": 32, "validation_records": 16,
               "optimizer_steps": outcome.global_step, "validation_metrics_non_official": metrics,
               "checkpoint": str(checkpoint), "parameter_update_verified": True,
-              "save_reload_verified": True,
+              "save_reload_verified": reload_diagnostics["save_reload_verified"],
+              "save_reload_diagnostics": reload_diagnostics,
               "test_used": False, "runtime": runtime}
     result_dir.mkdir(parents=True, exist_ok=False)
     (result_dir / "smoke_test_NO_OFICIAL.json").write_bytes(_json_bytes(result))
