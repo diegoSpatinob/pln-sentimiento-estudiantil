@@ -1,0 +1,369 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[spanish,es-tabla]{babel}
+\usepackage{lmodern}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{booktabs,array,tabularx,amsmath}
+\usepackage{microtype}
+\usepackage{xurl}
+\usepackage[hidelinks]{hyperref}
+\usepackage{fancyhdr}
+\hypersetup{pdftitle={Clasificación de sentimiento en comentarios estudiantiles},
+ pdfauthor={Diego Patiño y María José Vire},pdfsubject={Informe final de Ciencia de Datos}}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{6pt}
+\renewcommand{\arraystretch}{1.15}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small Clasificación de sentimiento en comentarios estudiantiles}
+\fancyfoot[C]{\thepage}
+\setlength{\headheight}{14pt}
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\artifact}[1]{\path{#1}}
+\begin{document}
+\hypersetup{pageanchor=false}
+\begin{titlepage}
+\centering
+\vspace*{2cm}
+{\Large Ciencia de Datos\par}
+\vspace{1.6cm}
+{\LARGE\bfseries Clasificación de sentimiento en comentarios estudiantiles\par}
+\vspace{0.7cm}
+{\large Comparación de TF-IDF con Regresión Logística y BETO\par}
+\vspace{1.5cm}
+{\large Informe final\par}
+\vfill
+\begin{tabular}{rl}
+Integrantes: & Diego Patiño\\
+ & María José Vire\\[0.7em]
+Docente: & Ing. Jorge Maldonado\\[0.7em]
+Asignatura: & Ciencia de Datos
+\end{tabular}
+\vspace{1.5cm}
+\par 4 de octubre de 2026
+\vspace*{1cm}
+\end{titlepage}
+\hypersetup{pageanchor=true}
+\pagenumbering{arabic}
+
+\section{Introducción}
+Los comentarios estudiantiles ofrecen información sobre experiencias y percepciones
+relacionadas con la actividad universitaria. Su clasificación automática por sentimiento
+permite organizar esta información, aunque no reemplaza la interpretación del contexto
+educativo ni la revisión de los casos ambiguos.
+
+Este proyecto estudió una tarea supervisada de clasificación binaria de comentarios en
+español. Se comparó un enfoque de representación léxica, TF-IDF con Regresión Logística,
+con BETO, un modelo Transformer preentrenado en español. Ambos enfoques utilizaron el
+mismo predictor textual y las mismas particiones de datos. Se separaron el entrenamiento,
+la selección mediante validación y la evaluación final sobre prueba, con el propósito
+de evitar que los resultados finales influyeran en las decisiones del modelado.
+
+\section{Objetivo}
+Clasificar cada comentario como Negativo (0) o Positivo (1), a partir exclusivamente de
+\code{comentario_limpio}, y comparar el rendimiento de un modelo base clásico y BETO
+mediante F1-macro como métrica principal. La variable objetivo fue \code{sentimiento_id}.
+Se complementó la evaluación con accuracy, precisión y recall macro, métricas por clase
+y matrices de confusión.
+
+\section{Dataset y preparación de datos}
+Se utilizó el \textit{Student Feedback Sentiment Analysis Dataset}, versión 1.0.1,
+publicado por Anabel Pineda-Briseño y Jimy Oblitas en Zenodo, registro 18797217
+\cite{dataset}. El archivo original contenía 23\,168 registros y las variables
+\code{comentario}, \code{Valor} y \code{nombreAspecto}.
+
+La preparación preservó el contenido lingüístico: únicamente se normalizaron secuencias
+de espacios en blanco y se eliminaron espacios al inicio y al final. Se conservaron
+mayúsculas, tildes, negaciones, signos y números. Se excluyeron dos registros con el
+marcador no interpretable \code{#¿NOMBRE?}, ocho observaciones con etiquetas contradictorias
+para textos normalizados equivalentes y 35 duplicados excedentes con etiquetas
+consistentes. Para estos últimos se retuvo el menor índice original. En total se
+retiraron 45 registros y se conservaron 23\,123 observaciones.
+
+Se realizó una partición estratificada 70/15/15 con semilla 42. Se verificó la ausencia
+de índices y textos normalizados compartidos entre particiones. \code{nombreAspecto}
+no fue predictor; \code{Valor} se utilizó para codificar las etiquetas y
+\code{indice_original} se mantuvo para trazabilidad.
+
+\begin{table}[h!]
+\centering
+\caption{Particiones congeladas, compartidas por ambos enfoques.}
+\begin{tabular}{lrrr}
+\toprule
+Partición & Registros & Negativo (0) & Positivo (1)\\
+\midrule
+Train & 16\,186 & 6\,870 & 9\,316\\
+Validation & 3\,468 & 1\,472 & 1\,996\\
+Test & 3\,469 & 1\,473 & 1\,996\\
+\midrule
+Total & 23\,123 & 9\,815 & 13\,308\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\newpage
+\section{Modelo base}
+El modelo base fue un pipeline de scikit-learn con \code{TfidfVectorizer} y
+\code{LogisticRegression} \cite{tfidf,logreg,pipeline}. Tanto el vocabulario como los
+coeficientes del clasificador se ajustaron únicamente con train; validation se utilizó
+para comparar configuraciones. No se reajustó el modelo sobre la unión de train y
+validation antes de la evaluación final.
+
+El notebook de datos documentó seis configuraciones que variaron el rango de n-gramas
+y el parámetro de regularización $C$. Se seleccionó C1, basada en unigramas y $C=1.0$.
+El vectorizador utilizó \code{min_df=2}, \code{max_features=20000}, conversión a minúsculas,
+normalización L2 y suavizado de IDF. No se eliminaron stop words ni tildes. El vocabulario
+ajustado de C1 contuvo 5\,653 características.
+
+La Regresión Logística empleó penalización L2, solver \code{liblinear}, un máximo de
+1\,000 iteraciones, semilla 42 y sin pesos de clase. En validation, C1 obtuvo
+\textbf{F1-macro = 0.8757} y \textbf{accuracy = 0.8789}. Se conservó el pipeline ajustado
+para la prueba final, en lugar de volver a entrenarlo después de seleccionar la configuración.
+
+\section{Modelo Transformer}
+Se utilizó BETO cased, identificado como
+\code{dccuchile/bert-base-spanish-wwm-cased}, mediante Hugging Face Transformers 4.57.1.
+El tokenizer y el modelo compartieron una revisión fijada. Cada experimento partió
+del modelo preentrenado original, con una cabeza de clasificación binaria, y no de
+un checkpoint afinado de otro experimento. Se usaron dos etiquetas con el mapeo
+Negativo = 0 y Positivo = 1.
+
+\subsection{Tokenización y longitud máxima}
+La longitud máxima se determinó exclusivamente con los 16\,186 comentarios de train.
+Se tokenizaron sin truncamiento ni padding, incluyendo los tokens especiales. La
+mediana fue de 14 tokens, el percentil 95 de 52 y el percentil 99 de 103.15.
+La regla previa al análisis consistió en elegir el menor candidato de
+$\{64,128,256,512\}$ que cubriera al menos el 99\,\% de train.
+
+\begin{table}[h!]
+\centering
+\caption{Cobertura de las longitudes candidatas en train.}
+\begin{tabular}{rrr}
+\toprule
+Límite (tokens) & Cobertura (\%) & Secuencias que excedieron el límite\\
+\midrule
+64 & 96.9480 & 494\\
+128 & 99.3822 & 100\\
+256 & 99.8950 & 17\\
+512 & 99.9938 & 1\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Se fijó \code{max_length=128}: fue el menor candidato que satisfizo la regla y dejó
+un 0.6178\,\% de secuencias de train por encima del límite. Durante el entrenamiento
+y la evaluación se aplicó truncamiento a esa longitud y padding dinámico por batch.
+Validation y test no participaron en esta decisión. Los únicos datos predictivos
+fueron el texto tokenizado y su etiqueta; los índices y los hashes se conservaron
+como metadatos separados.
+
+\newpage
+\section{Diseño experimental}
+Se realizaron tres experimentos independientes de BETO, diferenciados únicamente por
+la tasa de aprendizaje: T1 ($1\times10^{-5}$), T2 ($2\times10^{-5}$) y
+T3 ($3\times10^{-5}$). Los tres utilizaron las mismas particiones, revisión del modelo,
+longitud máxima y reglas de evaluación.
+
+\begin{table}[h!]
+\centering
+\caption{Configuración común del entrenamiento Transformer.}
+\begin{tabularx}{\linewidth}{lX}
+\toprule
+Parámetro & Valor\\
+\midrule
+Semilla & 42\\
+Épocas & 3\\
+Longitud máxima & 128 tokens\\
+Weight decay & 0.01\\
+Batch físico / acumulación / efectivo & 16 / 1 / 16\\
+Dispositivo y precisión & GPU Tesla T4; FP16\\
+Optimizador y scheduler & AdamW de PyTorch; scheduler lineal; cero pasos de warmup\\
+Evaluación y guardado & Al finalizar cada época\\
+Pesos de clase / oversampling / early stopping & No aplicados\\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Se conservaron los tres checkpoints de cada experimento, uno por época. Se desactivó
+la selección automática del mejor modelo al terminar el entrenamiento
+(\code{load_best_model_at_end=False}); la selección se efectuó explícitamente con la
+regla del proyecto, sobre validation. La interfaz de entrenamiento utilizó
+\code{Trainer} y las opciones de evaluación por época de Transformers \cite{trainer}.
+
+\section{Selección mediante validación}
+La regla priorizó el F1-macro de validation redondeado a cuatro decimales. En caso de
+empate, se compararon accuracy, menor learning rate y, finalmente, época más temprana.
+La regla se aplicó para seleccionar la época de cada experimento y el ganador global.
+El conjunto de prueba no intervino en ninguna de estas decisiones.
+
+\begin{table}[h!]
+\centering
+\caption{Resultados de validación comunicados para las configuraciones de BETO.}
+\begin{tabular}{lrrr}
+\toprule
+Experimento & Learning rate & F1-macro & Accuracy\\
+\midrule
+T1 & $1\times10^{-5}$ & 0.9141 & 0.9158\\
+\textbf{T2} & $2\times10^{-5}$ & \textbf{0.9164} & \textbf{0.9181}\\
+T3 & $3\times10^{-5}$ & 0.9100 & 0.9118\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+La selección quedó fijada en \textbf{T2}, learning rate $2\times10^{-5}$,
+\textbf{época 3} y \code{checkpoint-3036}. Estos identificadores están registrados en
+el JSON de evaluación final y en el notebook de BETO. La elección se cerró antes de
+la evaluación predictiva de test.
+
+\textit{Alcance de la evidencia:} la tabla recoge los valores oficiales comunicados
+por el equipo. Los JSON individuales de T1/T2/T3 y el resumen de selección no están
+versionados ni disponibles en la copia local. El notebook conservado tampoco contiene
+outputs con esos seis valores, por lo que no pudieron corroborarse en archivos.
+Las métricas de C1 en validation y las de ambos modelos en test sí se verificaron
+en sus JSON. No se reconstruyeron resultados faltantes.
+
+\newpage
+\section{Evaluación final sobre test}
+Se evaluaron ambos modelos congelados sobre las mismas 3\,469 observaciones de test.
+El predictor fue \code{comentario_limpio} y el objetivo, \code{sentimiento_id}.
+Ambos resultados registraron el mismo SHA-256 del CSV y de sus metadatos. La interfaz
+exigió confirmación explícita y un marcador por intento para impedir repeticiones
+accidentales en el mismo directorio.
+
+Para BETO se cargó exclusivamente \code{checkpoint-3036} de T2. La evaluación se
+realizó en CPU con FP32, sin autocast FP16, con \code{torch.inference_mode()} y el
+modelo en modo de evaluación. El paso de GPU/FP16 durante el entrenamiento a CPU/FP32
+para inferencia no modificó los pesos ni el checkpoint seleccionado. C1 se cargó desde
+su pipeline serializado, sin llamar a \code{fit}. Los dos JSON registraron una
+única evaluación predictiva, sin entrenamiento ni reselección.
+
+F1-macro se calculó como la media no ponderada del F1 de las dos clases
+\cite{f1}. La accuracy midió la proporción de aciertos. Precisión y recall macro
+se promediaron igualmente entre clases, con \code{zero_division=0}. Para BETO, las
+predicciones se obtuvieron mediante argmax de logits, sin ajustar umbrales con test.
+
+\section{Comparación de resultados}
+\begin{table}[h!]
+\centering
+\caption{Evaluación final sobre test. Deltas calculados como BETO menos C1.}
+\begin{tabular}{lrrr}
+\toprule
+Métrica & Baseline C1 & BETO T2 & Diferencia\\
+\midrule
+Accuracy & 0.8694 & 0.9092 & +0.0398\\
+F1-macro & 0.8662 & 0.9073 & +0.0411\\
+Precisión macro & 0.8667 & 0.9064 & +0.0397\\
+Recall macro & 0.8658 & 0.9085 & +0.0427\\
+F1 Negativo & 0.8456 & 0.8942 & ---\\
+F1 Positivo & 0.8869 & 0.9205 & ---\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+BETO T2 obtuvo el mayor F1-macro en este conjunto de prueba: 0.9073 frente
+a 0.8662 de C1. La diferencia fue de +0.0411 en escala 0--1, equivalente
+aproximadamente a 4.11 puntos porcentuales. Las cuatro métricas globales y el F1 de
+ambas clases fueron mayores para BETO. Los deltas se calcularon con los valores
+completos de los JSON y se redondearon a cuatro decimales para su presentación.
+Esta comparación fue descriptiva y no constituyó una nueva selección.
+
+\begin{table}[h!]
+\centering
+\caption{Matrices de confusión en test: filas reales y columnas predichas, orden $[0,1]$.}
+\begin{tabular}{lrr@{\hspace{1.2cm}}lrr}
+\toprule
+\multicolumn{3}{c}{Baseline C1} & \multicolumn{3}{c}{BETO T2}\\
+\cmidrule(r){1-3}\cmidrule(l){4-6}
+Clase real & Pred. 0 & Pred. 1 & Clase real & Pred. 0 & Pred. 1\\
+\midrule
+Negativo (0) & 1240 & 233 & Negativo (0) & 1331 & 142\\
+Positivo (1) & 220 & 1776 & Positivo (1) & 173 & 1823\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+C1 cometió 453 errores y BETO 315: 138 errores menos en términos agregados.
+Los negativos clasificados como positivos disminuyeron de 233 a 142, y los positivos
+clasificados como negativos, de 220 a 173. Los recuentos no identifican qué ejemplos
+se corrigieron. El F1 de Negativo fue menor que el de Positivo en ambos modelos;
+no se atribuye esta diferencia a una causa específica sin analizar los errores.
+
+\newpage
+\section{Conclusiones}
+En el conjunto de prueba reservado, BETO T2 presentó un rendimiento predictivo mayor
+que el modelo base TF-IDF con Regresión Logística. La ventaja se observó en F1-macro,
+accuracy, precisión macro, recall macro y F1 de cada clase. La disminución agregada
+de errores afectó a ambos tipos de confusión, por lo que la mejora no se limitó a
+una sola clase.
+
+La separación entre entrenamiento, validación y prueba permitió distinguir la elección
+del modelo de la descripción de su rendimiento final. T2 y su checkpoint de la tercera
+época se fijaron mediante validation; después de observar test no se reentrenó, no
+se ajustaron hiperparámetros y no se seleccionó otro checkpoint. La inferencia en CPU
+reutilizó los parámetros aprendidos durante el entrenamiento en GPU.
+
+Las conclusiones se limitan a este dataset, su preparación y la partición utilizada.
+No se evaluaron otros dominios o instituciones, ni se estimaron intervalos de confianza
+o significación estadística de las diferencias. No se puede afirmar generalización
+fuera del corpus ni superioridad universal de BETO. Los recuentos tampoco explican
+por sí solos los fenómenos lingüísticos de los errores. La exclusión de contradicciones
+y duplicados delimitó la población estudiada.
+
+\section{Reproducibilidad}
+El entrenamiento y la selección utilizaron el commit
+\begin{center}\small\code{90afa082979bbe396f5a6a4906cadee9c351dd4f}\end{center}
+La evaluación final de ambos modelos registró el commit
+\begin{center}\small\code{ddc3d2e51246e8450a0d000cd48af55bf101f878}\end{center}
+Los JSON finales declararon un árbol de trabajo limpio. La configuración y la revisión
+de BETO se verificaron antes de cargar el checkpoint. La revisión del modelo fue
+\begin{center}\small\code{c4d86612f51b4f46759c8390d1798c2febe71b93}\end{center}
+El SHA-256 compartido de test fue:
+\begin{center}\small\artifact{f1e7c5da7760aaf3ee0f89c3d86d1307db5a347cb1b543f551276b12e9c7851b}\end{center}
+La reproducción requiere las particiones congeladas, sus metadatos, el pipeline C1
+y los archivos del checkpoint seleccionado. Los datos procesados y los modelos no
+se redistribuyeron en el repositorio. Los hashes identifican los artefactos concretos;
+la semilla 42 y las versiones fijadas apoyan la reproducibilidad, sin asegurar
+determinismo total del entrenamiento entre entornos.
+
+La inferencia de BETO registró Python 3.13.15, PyTorch 2.11.0+cpu y Transformers 4.57.1.
+C1 registró Python 3.12.3, scikit-learn 1.6.1, joblib 1.6.0 y NumPy 2.1.3. El tiempo
+medido de predicción y cálculo de métricas fue de 876.8544 s para BETO y 0.0417 s
+para C1. Excluyó la verificación previa y la carga de modelos. Dado que las ejecuciones
+se realizaron en entornos distintos y sin un benchmark controlado de hardware, estos
+tiempos se presentan como trazabilidad, no como una comparación normalizada de eficiencia.
+
+Las fuentes internas fueron los notebooks de datos y preparación, el cuaderno
+\artifact{03_BETO_reproducible_FINAL.ipynb}, la configuración, los metadatos y los JSON
+\artifact{transformer_T2_test.json}, \artifact{baseline_C1_test.json} y
+\artifact{comparison_test.json}. El informe se elaboró sin repetir entrenamiento
+ni predicciones sobre test.
+
+\newpage
+\begin{thebibliography}{9}
+\addcontentsline{toc}{section}{Referencias}
+\bibitem{dataset} Pineda-Briseño, A., y Oblitas, J. (s. f.).
+\textit{Student Feedback Sentiment Analysis Dataset} (versión 1.0.1).
+Zenodo. \url{https://doi.org/10.5281/zenodo.18797217}
+
+\bibitem{tfidf} scikit-learn. (s. f.). \textit{TfidfVectorizer}.
+Documentación oficial.
+\url{https://scikit-learn.org/stable/modules/generated/sklearn.feature_extraction.text.TfidfVectorizer.html}
+
+\bibitem{logreg} scikit-learn. (s. f.). \textit{LogisticRegression}.
+Documentación oficial.
+\url{https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.LogisticRegression.html}
+
+\bibitem{pipeline} scikit-learn. (s. f.). \textit{Pipeline}.
+Documentación oficial.
+\url{https://scikit-learn.org/stable/modules/generated/sklearn.pipeline.Pipeline.html}
+
+\bibitem{f1} scikit-learn. (s. f.). \textit{f1\_score}.
+Documentación oficial.
+\url{https://scikit-learn.org/stable/modules/generated/sklearn.metrics.f1_score.html}
+
+\bibitem{trainer} Hugging Face. (s. f.). \textit{Trainer}.
+Documentación oficial de Transformers, versión 4.57.1.
+\url{https://huggingface.co/docs/transformers/v4.57.1/en/main_classes/trainer}
+\end{thebibliography}
+\end{document}
