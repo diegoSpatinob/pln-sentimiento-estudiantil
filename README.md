@@ -59,6 +59,12 @@ Si el directorio ya fue clonado en la misma sesión, no repetir el comando de cl
 
 Los archivos generados, excluidos de Git, son `data/processed/{train,validation,test}.csv`, `data/processed/metadata.json`, `models/baseline_C1.joblib`, `models/baseline_C1_metadata.json` y `results/baseline_C1_validation.json`. La interfaz de lectura para otra persona se documenta en [data/README.md](data/README.md). Debe recibir los CSV y su manifiesto juntos.
 
+La infraestructura BETO está preparada en Fase 3A para ejecutar posteriormente
+T1/T2/T3 en Colab. El smoke real de Fase 2B está verificado y sigue siendo NO OFICIAL;
+todavía no hay resultados oficiales Transformer. Véase el
+[protocolo y auditoría de Fase 3A](docs/fase3a_transformer.md) para comandos,
+checkpoints, selección única y artefactos. Test continúa reservado.
+
 ## Avance del modelo base
 
 El notebook desarrollado hasta la etapa 5 parte de **23.168** registros y conserva **23.123** después de los criterios documentados de limpieza. Distribución estratificada con semilla 42: entrenamiento **16.186**, validación **3.468**, prueba **3.469**.

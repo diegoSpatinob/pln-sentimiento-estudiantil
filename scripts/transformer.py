@@ -1,11 +1,12 @@
-"""Infraestructura BETO: preanálisis (1C) y preparación del fine-tuning (2A).
+"""Infraestructura BETO: preanálisis, smoke NO OFICIAL y experimentos oficiales.
 
 Desde la raíz, reproducir sin cambiar la configuración:
     python -m scripts.transformer
 Registrar explícitamente la longitud derivada de train:
     python -m scripts.transformer --record-max-length
 El modo predeterminado solo descarga el tokenizer. --smoke-test requiere una
-invocación explícita y dependencias de entrenamiento. No hay CLI para T1/T2/T3.
+invocación explícita y dependencias de entrenamiento. --experiment T1/T2/T3
+lanza únicamente el experimento indicado; --summarize compara tres runs completos.
 Importar este módulo nunca inicializa ni entrena un modelo.
 """
 
@@ -16,7 +17,10 @@ import os
 import platform
 import random
 import re
+import subprocess
+import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from importlib.metadata import version
 from pathlib import Path
 from uuid import uuid4
@@ -30,6 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / "configs/transformer.json"
 ANALYSIS_PATH = ROOT / "results/transformer/token_length_analysis.json"
 MODEL_ID = "dccuchile/bert-base-spanish-wwm-cased"
+EXPERIMENT_LEARNING_RATES = {"T1": 1e-5, "T2": 2e-5, "T3": 3e-5}
 EXPECTED_SIZES = {"train": 16186, "validation": 3468, "test": 3469}
 CANDIDATES = [64, 128, 256, 512]
 SELECTION_RULE = {
@@ -48,6 +53,9 @@ FIXED = {
     "max_length_rule": {"candidates": CANDIDATES, "minimum_coverage": 0.99, "split": "train"},
     "padding_strategy": "dynamic_per_batch_DataCollatorWithPadding",
     "checkpoints_dir": "models/transformer/", "results_dir": "results/transformer/",
+    "physical_batch_size": 16, "gradient_accumulation_steps": 1,
+    "precision": "fp16", "training_device": "cuda",
+    "class_weight": None, "oversampling": False, "early_stopping": False,
 }
 
 
@@ -63,6 +71,14 @@ def _json_bytes(value):
 
 def _file_hash(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _write_run_json(path, value):
+    """Actualización atómica de metadata mutable del run actual, sin JSON truncado."""
+    path = Path(path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_bytes(_json_bytes(value))
+    temporary.replace(path)
 
 
 def validate_config(config):
@@ -504,10 +520,10 @@ def initialize_original_model(config, base_dir=ROOT, local_files_only=False):
 
 
 def training_argument_values(config, experiment_id, learning_rate, physical_batch_size,
-                             precision, runtime, base_dir=ROOT, smoke=False):
+                             precision, runtime, base_dir=ROOT, smoke=False, run_id=None):
     """Plan de argumentos sin inicializar Trainer/modelo ni seleccionar hiperparámetros.
 
-    Batch y precisión deben indicarse explícitamente después de inspeccionar Colab.
+    Oficial: LR ligado al ID; CUDA/fp16, batch 16/acumulación 1 ya fijados.
     Se admite un solo proceso/dispositivo para garantizar batch efectivo 16.
     """
     validate_config(config)
@@ -526,18 +542,25 @@ def training_argument_values(config, experiment_id, learning_rate, physical_batc
         _require(re.fullmatch(r"SMOKE_[A-Za-z0-9_-]+", experiment_id), "ID smoke debe empezar por SMOKE_.")
         relative = Path("models/transformer/smoke") / experiment_id
     else:
-        _require(experiment_id in {"T1", "T2", "T3"}, "ID oficial debe ser T1, T2 o T3.")
-        relative = Path("models/transformer") / experiment_id
+        _require(experiment_id in EXPERIMENT_LEARNING_RATES, "ID oficial debe ser T1, T2 o T3.")
+        _require(learning_rate == EXPERIMENT_LEARNING_RATES[experiment_id],
+                 "El learning rate no corresponde al experimento oficial.")
+        _require(physical_batch_size == 16 and precision == "fp16"
+                 and runtime["device"] == "cuda", "Oficial requiere batch=16, fp16 y CUDA.")
+        _require(isinstance(run_id, str) and re.fullmatch(r"RUN_[0-9a-f]{32}", run_id),
+                 "El run oficial requiere un ID RUN_<uuid completo>.")
+        relative = Path("models/transformer") / experiment_id / run_id
     return {
-        "output_dir": str(Path(base_dir) / relative), "run_name": experiment_id,
+        "output_dir": str(Path(base_dir) / relative), "run_name": run_id or experiment_id,
         "learning_rate": learning_rate, "weight_decay": config["weight_decay"],
         "num_train_epochs": 1 if smoke else config["max_epochs"], "max_steps": 2 if smoke else -1,
         "per_device_train_batch_size": physical_batch_size,
         "per_device_eval_batch_size": physical_batch_size,
         "gradient_accumulation_steps": 16 // physical_batch_size,
         "eval_strategy": "epoch", "save_strategy": "epoch", "logging_strategy": "epoch",
-        "load_best_model_at_end": True, "metric_for_best_model": "f1_macro",
-        "greater_is_better": True, "save_total_limit": 2, "save_safetensors": True,
+        "load_best_model_at_end": smoke, "metric_for_best_model": "f1_macro" if smoke else None,
+        "greater_is_better": True if smoke else None,
+        "save_total_limit": 2 if smoke else 3, "save_safetensors": True,
         "seed": config["seed"], "data_seed": config["seed"],
         "fp16": precision == "fp16", "bf16": precision == "bf16",
         "use_cpu": runtime["device"] == "cpu", "optim": "adamw_torch",
@@ -546,6 +569,48 @@ def training_argument_values(config, experiment_id, learning_rate, physical_batc
         "remove_unused_columns": False, "label_names": ["labels"],
         "report_to": "none", "push_to_hub": False,
     }
+
+
+def validation_selection_key(candidate):
+    """Única clave: round(F1,4), accuracy sin redondear, menor LR, menor época.
+
+    round es el redondeo de Python (empates al par); las métricas originales se
+    conservan. El mismo orden sirve dentro de un run y entre T1/T2/T3.
+    """
+    f1 = float(candidate["metrics"]["f1_macro"])
+    accuracy = float(candidate["metrics"]["accuracy"])
+    learning_rate, epoch = float(candidate["learning_rate"]), float(candidate["epoch"])
+    _require(np.isfinite([f1, accuracy, learning_rate, epoch]).all()
+             and 0 <= f1 <= 1 and 0 <= accuracy <= 1 and learning_rate > 0 and epoch > 0,
+             "Candidato de validation inválido.")
+    return (round(f1, 4), accuracy, -learning_rate, -epoch)
+
+
+def select_validation_candidate(candidates):
+    """Devuelve el candidato ganador sin alterar métricas ni entrenar/evaluar."""
+    candidates = list(candidates)
+    _require(bool(candidates), "No hay candidatos de validation.")
+    return max(candidates, key=validation_selection_key)
+
+
+def git_metadata(base_dir=ROOT):
+    """Identifica el commit y también cambios locales: HEAD solo no basta."""
+    def git(*arguments):
+        return subprocess.check_output(["git", *arguments], cwd=base_dir)
+
+    return {"commit": git("rev-parse", "HEAD").decode().strip(),
+            "dirty": bool(git("status", "--porcelain", "--untracked-files=all")),
+            "diff_sha256": hashlib.sha256(git("diff", "HEAD", "--binary")).hexdigest(),
+            "transformer_script_sha256": _file_hash(Path(__file__))}
+
+
+def require_clean_working_tree(base_dir=ROOT):
+    """Rechaza cambios rastreados/no ignorados antes de preparar un run oficial."""
+    metadata = git_metadata(base_dir)
+    _require(not metadata["dirty"],
+             "Ejecución oficial requiere git status --porcelain vacío; "
+             "hay cambios versionados o archivos no rastreados no ignorados.")
+    return metadata
 
 
 def build_training_arguments(*args, **kwargs):
@@ -574,9 +639,13 @@ def development_trainer_class(base_dir=ROOT):
             super().__init__(*args, **kwargs)
 
         def train(self, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None, **kwargs):
+            _require(not kwargs, "No se admiten argumentos antiguos de resume como model_path.")
             _require(resume_from_checkpoint is None or resume_from_checkpoint is False,
                      "No se reutilizan checkpoints entre experimentos.")
             _require(not self._started and trial is None, "Crear un Trainer nuevo para cada ejecución.")
+            for name, expected in getattr(self, "protocol_arguments", {}).items():
+                _require(getattr(self.args, name) == expected,
+                         f"Argumento de entrenamiento alterado después de preparar el run: {name}.")
             guard_development_dataset(self.train_dataset, "train", base_dir)
             guard_development_dataset(self.eval_dataset, "validation", base_dir)
             _require(not any(Path(self.args.output_dir).glob("checkpoint-*")),
@@ -612,11 +681,14 @@ def development_trainer_class(base_dir=ROOT):
             raise ValueError("La selección entre T1/T2/T3 corresponde a una fase posterior.")
 
         def _determine_best_metric(self, metrics, trial):
-            # API interna comprobada en 4.57.1. Dentro del run LR es constante;
-            # empates en F1 a 4 decimales se resuelven por accuracy y época temprana.
+            # Oficial: HF no selecciona nada. Selección post-training sobre las
+            # tres épocas persistidas. Smoke conserva su recarga técnica previa.
+            if self.args.metric_for_best_model is None:
+                return False
             f1, accuracy = float(metrics["eval_f1_macro"]), float(metrics["eval_accuracy"])
-            _require(np.isfinite([f1, accuracy]).all(), "Métricas no finitas.")
-            key = (round(f1, 4), accuracy)
+            key = validation_selection_key({"metrics": {"f1_macro": f1, "accuracy": accuracy},
+                                            "learning_rate": self.args.learning_rate,
+                                            "epoch": self.state.epoch or 1})
             if self._best_validation_key is None or key > self._best_validation_key:
                 self._best_validation_key = key
                 self.state.best_metric = f1
@@ -629,7 +701,7 @@ def development_trainer_class(base_dir=ROOT):
 
 def build_trainer(config, tokenizer, datasets, experiment_id, learning_rate,
                   physical_batch_size, precision, device="auto", base_dir=ROOT,
-                  smoke=False, local_files_only=False):
+                  smoke=False, local_files_only=False, run_id=None):
     """Preparación explícita para ejecución posterior; esta función no llama train().
 
     Trainer inicializa el modelo al construirse: invocar solo en el entorno futuro.
@@ -638,21 +710,31 @@ def build_trainer(config, tokenizer, datasets, experiment_id, learning_rate,
     # Fija una copia del protocolo para model_init y el manifiesto: un cambio en
     # el diccionario del llamador no puede alterar inicializaciones posteriores.
     config = json.loads(_json_bytes(config))
+    registered_path = Path(base_dir) / "configs/transformer.json"
+    _require(config == load_config(registered_path), "Usar exactamente la configuración registrada.")
+    config_sha256 = _file_hash(registered_path)
+    run_id = experiment_id if smoke else (run_id or f"RUN_{uuid4().hex}")
     _require(set(datasets) == {"train", "validation"}, "Solo train/validation están autorizados.")
     for name, dataset in datasets.items():
         guard_development_dataset(dataset, name, base_dir)
         _require(dataset.smoke is smoke, "No mezclar datasets smoke y oficiales.")
     runtime = detect_runtime(device)
     values = training_argument_values(config, experiment_id, learning_rate, physical_batch_size,
-                                      precision, runtime, base_dir, smoke)
+                                      precision, runtime, base_dir, smoke, run_id)
     output = Path(values["output_dir"])
     _require(not output.exists(), "Directorio de experimento ya existente; no se sobrescribe ni reanuda.")
     arguments = build_training_arguments(config, experiment_id, learning_rate, physical_batch_size,
-                                         precision, runtime, base_dir, smoke)
+                                         precision, runtime, base_dir, smoke, run_id)
     trainer_type = development_trainer_class(base_dir)
     from transformers import DataCollatorWithPadding
 
+    result_dir = (Path(base_dir) / "results/transformer" / experiment_id / run_id
+                  if not smoke else Path(base_dir) / "results/transformer/smoke" / run_id)
+    _require(not result_dir.exists(), "Resultados existentes; crear una ejecución nueva.")
+    git = git_metadata(base_dir) if smoke else require_clean_working_tree(base_dir)
     output.mkdir(parents=True, exist_ok=False)
+    if not smoke:
+        result_dir.mkdir(parents=True, exist_ok=False)
     trainer = trainer_type(
         args=arguments, model_init=lambda: initialize_original_model(config, base_dir, local_files_only),
         train_dataset=datasets["train"], eval_dataset=datasets["validation"],
@@ -661,8 +743,16 @@ def build_trainer(config, tokenizer, datasets, experiment_id, learning_rate,
     )
     manifest = {
         "status": "PREPARED_NO_TRAINING_RESULTS", "official": not smoke,
-        "purpose": "SMOKE_TEST_NO_OFICIAL" if smoke else "FUTURE_EXPERIMENT",
-        "experiment_id": experiment_id, "configuration": config, "runtime": runtime,
+        "purpose": "SMOKE_TEST_NO_OFICIAL" if smoke else "OFFICIAL_EXPERIMENT",
+        "experiment_id": experiment_id, "run_id": run_id,
+        "created_at_utc": datetime.now(timezone.utc).isoformat(), "git": git,
+        "git_commit": git["commit"], "working_tree_clean": not git["dirty"],
+        "configuration_sha256": config_sha256,
+        "configuration": config, "runtime": runtime, "test_used": False,
+        "learning_rate": learning_rate, "physical_batch_size": physical_batch_size,
+        "gradient_accumulation_steps": values["gradient_accumulation_steps"],
+        "effective_batch_size": physical_batch_size * values["gradient_accumulation_steps"],
+        "precision": precision, "resume_from_checkpoint": False,
         "accelerate": version("accelerate"), "training_arguments": arguments.to_dict(),
         "initial_checkpoint": {"model_id": config["model_id"], "revision": config["model_revision"]},
         "data": {name: {"records": len(dataset), "sha256": dataset.source_sha256,
@@ -670,8 +760,262 @@ def build_trainer(config, tokenizer, datasets, experiment_id, learning_rate,
                  for name, dataset in datasets.items()},
         "test_policy": config["test_policy"],
     }
-    (output / "run_manifest.json").write_bytes(_json_bytes(manifest))
+    _write_run_json(output / "run_manifest.json", manifest)
+    if not smoke:
+        _write_run_json(result_dir / "run_manifest.json", manifest)
+    trainer.run_manifest = manifest
+    trainer.result_dir = result_dir
+    # TrainingArguments normaliza p.ej. report_to="none" a []; comparar contra
+    # esa representación efectiva, no contra el constructor sin normalizar.
+    effective_arguments = arguments.to_dict()
+    trainer.protocol_arguments = {name: effective_arguments[name] for name in values}
     return trainer
+
+
+def _write_run_manifest(trainer, manifest):
+    for directory in (Path(trainer.args.output_dir), trainer.result_dir):
+        _write_run_json(directory / "run_manifest.json", manifest)
+
+
+def persist_validation_epoch(manifest, epochs, metrics, epoch, global_step,
+                             output_dir, result_dir, base_dir=ROOT):
+    """Registra una evaluación real solo cuando existe su checkpoint de época.
+
+    Es independiente de Trainer para poder probar la persistencia con dobles.
+    No guarda logits, textos ni predicciones.
+    """
+    _require(manifest["official"] is True and manifest["test_used"] is False,
+             "Solo runs oficiales sin uso de test.")
+    _require(float(epoch).is_integer() and 1 <= epoch <= 3
+             and type(global_step) is int and global_step > 0, "Época/paso inválidos.")
+    _require(not any(row["epoch"] == epoch for row in epochs), "Época ya registrada.")
+    checkpoint = Path(output_dir) / f"checkpoint-{global_step}"
+    _require((checkpoint / "model.safetensors").is_file()
+             and (checkpoint / "trainer_state.json").is_file(), "Checkpoint de época incompleto.")
+    names = ["f1_macro", "accuracy", "precision_macro", "recall_macro"]
+    names += [f"{metric}_class_{label}" for label in (0, 1)
+              for metric in ("precision", "recall", "f1", "support")]
+    validation_metrics = {name: (int(metrics[f"eval_{name}"]) if name.startswith("support_class_")
+                                else float(metrics[f"eval_{name}"])) for name in names}
+    _require(np.isfinite(list(validation_metrics.values())).all(), "Métricas no finitas.")
+    row = {"experiment_id": manifest["experiment_id"], "run_id": manifest["run_id"],
+           "learning_rate": manifest["learning_rate"], "epoch": int(epoch),
+           "global_step": global_step,
+           "checkpoint": checkpoint.resolve().relative_to(Path(base_dir).resolve()).as_posix(),
+           "metrics": validation_metrics}
+    validation_selection_key(row)
+    epochs.append(row)
+    _write_run_json(Path(result_dir) / "validation_epochs.json", {
+        "official": True, "status": "RUNNING", "test_used": False,
+        "experiment_id": manifest["experiment_id"], "run_id": manifest["run_id"],
+        "evaluation_partition": "validation", "epochs": epochs,
+    })
+    return row
+
+
+def official_epoch_recorder(trainer, base_dir=ROOT):
+    """Callback: empareja on_evaluate con on_save, antes de persistir la época."""
+    from transformers import TrainerCallback
+
+    class OfficialEpochRecorder(TrainerCallback):
+        def __init__(self):
+            self.epochs = []
+            self.pending = None
+
+        def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+            _require(self.pending is None, "Evaluación anterior sin checkpoint.")
+            self.pending = (dict(metrics), state.epoch, state.global_step)
+
+        def on_save(self, args, state, control, **kwargs):
+            _require(self.pending is not None, "Guardado sin evaluación de validation.")
+            metrics, epoch, step = self.pending
+            _require(step == state.global_step and epoch == state.epoch,
+                     "Evaluación y checkpoint no corresponden a la misma época.")
+            persist_validation_epoch(trainer.run_manifest, self.epochs, metrics, epoch, step,
+                                     args.output_dir, trainer.result_dir, base_dir)
+            self.pending = None
+
+    return OfficialEpochRecorder()
+
+
+def run_official_experiment(experiment_id, base_dir=ROOT, local_files_only=False):
+    """Ejecutor FUTURO explícito; un run nuevo desde BETO, sin reanudación.
+
+    No se invoca durante Fase 3A. No admite overrides de hiperparámetros.
+    Al terminar, Trainer conserva la última época; el checkpoint oficial queda
+    identificado por select_validation_candidate y se carga por separado.
+    """
+    _require(experiment_id in EXPERIMENT_LEARNING_RATES, "Solo T1/T2/T3.")
+    initial_git = require_clean_working_tree(base_dir)
+    config = load_config(Path(base_dir) / "configs/transformer.json")
+    run_id = f"RUN_{uuid4().hex}"
+    learning_rate = EXPERIMENT_LEARNING_RATES[experiment_id]
+    runtime = detect_runtime("cuda")
+    training_argument_values(config, experiment_id, learning_rate, 16, "fp16", runtime,
+                             base_dir, run_id=run_id)
+    _require_training_backend()
+    set_seed(config["seed"])
+    tokenizer = load_tokenizer(config, base_dir, local_files_only)
+    datasets = prepare_training_datasets(tokenizer, config, base_dir, smoke=False)
+    trainer = build_trainer(config, tokenizer, datasets, experiment_id, learning_rate,
+                            16, "fp16", "cuda", base_dir, local_files_only=local_files_only,
+                            run_id=run_id)
+    manifest = trainer.run_manifest
+    _require(manifest["git_commit"] == initial_git["commit"],
+             "El commit cambió durante la preparación del run oficial.")
+    recorder = official_epoch_recorder(trainer, base_dir)
+    trainer.add_callback(recorder)
+    started = time.perf_counter()
+    manifest["status"] = "RUNNING"
+    _write_run_manifest(trainer, manifest)
+    try:
+        outcome = trainer.train(resume_from_checkpoint=False)
+        final_git = require_clean_working_tree(base_dir)
+        _require(final_git["commit"] == manifest["git_commit"],
+                 "El commit cambió durante el run; no se publican resultados oficiales.")
+        _require(recorder.pending is None and [row["epoch"] for row in recorder.epochs] == [1, 2, 3],
+                 "El run debe registrar las tres épocas completas antes de seleccionar.")
+        _require(_file_hash(Path(base_dir) / "configs/transformer.json")
+                 == manifest["configuration_sha256"], "La configuración cambió durante el run.")
+        for name in ("train", "validation"):
+            _require(_file_hash(Path(base_dir) / f"data/processed/{name}.csv")
+                     == manifest["data"][name]["sha256"], "Los datos cambiaron durante el run.")
+        selected = select_validation_candidate(recorder.epochs)
+        manifest.update(status="COMPLETED", runtime_seconds=time.perf_counter() - started)
+        result = {**manifest, "evaluation_partition": "validation", "epochs": recorder.epochs,
+                  "selected": selected, "selection_rule": SELECTION_RULE,
+                  "training_metrics": outcome.metrics,
+                  "checkpoint_loading": "load_selected_checkpoint(result, base_dir); local_files_only=True"}
+        validate_official_result(result, base_dir)
+        _write_run_json(trainer.result_dir / "validation_epochs.json", {
+            "official": True, "status": "COMPLETED", "test_used": False,
+            "experiment_id": experiment_id, "run_id": run_id,
+            "evaluation_partition": "validation", "epochs": recorder.epochs,
+        })
+        _write_run_manifest(trainer, manifest)
+        # Publicar el resultado elegible al final, tras completar los demás JSON.
+        payload = _json_bytes(result)
+        with (trainer.result_dir / "validation_result.json").open("xb") as stream:
+            stream.write(payload)
+        return result
+    except BaseException as error:
+        # También KeyboardInterrupt deja constancia; un corte abrupto conserva
+        # RUNNING y sus épocas completas. Ninguno es elegible para comparación.
+        manifest.update(status="FAILED_OR_INTERRUPTED", runtime_seconds=time.perf_counter() - started,
+                        failure_type=type(error).__name__)
+        _write_run_manifest(trainer, manifest)
+        raise
+
+
+def validate_official_result(result, base_dir=ROOT):
+    """Rechaza smoke, runs parciales, selecciones alteradas y checkpoints ajenos."""
+    config = load_config(Path(base_dir) / "configs/transformer.json")
+    _require(result["official"] is True and result["purpose"] == "OFFICIAL_EXPERIMENT"
+             and result["status"] == "COMPLETED" and result["test_used"] is False
+             and result["evaluation_partition"] == "validation", "Resultado no oficial o incompleto.")
+    git_commit = result.get("git_commit")
+    _require(result.get("working_tree_clean") is True
+             and isinstance(git_commit, str) and re.fullmatch(r"[0-9a-f]{40}", git_commit)
+             and result["git"]["commit"] == git_commit and result["git"]["dirty"] is False,
+             "Resultado oficial requiere código limpio del git_commit registrado.")
+    experiment_id, run_id = result["experiment_id"], result["run_id"]
+    _require(experiment_id in EXPERIMENT_LEARNING_RATES
+             and isinstance(run_id, str) and re.fullmatch(r"RUN_[0-9a-f]{32}", run_id),
+             "Identidad de ejecución inválida.")
+    _require(result["configuration"] == config and result["configuration_sha256"]
+             == _file_hash(Path(base_dir) / "configs/transformer.json"), "Configuración distinta.")
+    _require(result["learning_rate"] == EXPERIMENT_LEARNING_RATES[experiment_id]
+             and result["initial_checkpoint"] == {"model_id": config["model_id"],
+                                                    "revision": config["model_revision"]}
+             and result["resume_from_checkpoint"] is False
+             and result["physical_batch_size"] == 16 and result["gradient_accumulation_steps"] == 1
+             and result["effective_batch_size"] == 16 and result["precision"] == "fp16"
+             and result["runtime"]["device"] == "cuda"
+             and result["selection_rule"] == SELECTION_RULE, "Protocolo oficial distinto.")
+    _require(set(result["data"]) == {"train", "validation"}, "Datos ajenos al desarrollo.")
+    for name in ("train", "validation"):
+        _require(result["data"][name]["sha256"]
+                 == _file_hash(Path(base_dir) / f"data/processed/{name}.csv"), "Datos distintos.")
+    epochs = result["epochs"]
+    _require([row["epoch"] for row in epochs] == [1, 2, 3], "Faltan las tres épocas completas.")
+    run_dir = (Path(base_dir) / "models/transformer" / experiment_id / run_id).resolve()
+    for row in epochs:
+        checkpoint = (Path(base_dir) / row["checkpoint"]).resolve()
+        _require(row["experiment_id"] == experiment_id and row["run_id"] == run_id
+                 and row["learning_rate"] == result["learning_rate"]
+                 and checkpoint.parent == run_dir
+                 and checkpoint.name == f"checkpoint-{row['global_step']}"
+                 and (checkpoint / "model.safetensors").is_file()
+                 and (checkpoint / "trainer_state.json").is_file(), "Checkpoint ajeno o ausente.")
+    _require(result["selected"] == select_validation_candidate(epochs), "Selección oficial alterada.")
+    return result
+
+
+def load_selected_checkpoint(result, base_dir=ROOT):
+    """Carga localmente SOLO el checkpoint oficial seleccionado, sin evaluarlo.
+
+    Excepción explícita para consumo del resultado; nunca se usa en model_init
+    ni para comenzar otro experimento. Devuelve un modelo en modo eval en CPU.
+    """
+    validate_official_result(result, base_dir)
+    _require_training_backend()
+    from transformers import AutoModelForSequenceClassification
+
+    model = AutoModelForSequenceClassification.from_pretrained(
+        str(Path(base_dir) / result["selected"]["checkpoint"]),
+        local_files_only=True, trust_remote_code=False,
+    )
+    return model.eval()
+
+
+def summarize_validation(result_paths, base_dir=ROOT, output_path=None):
+    """Tres resultados explícitos (uno por ID); jamás elige un rerun por fecha.
+
+    No carga modelos, no predice y no sobrescribe resúmenes previos.
+    """
+    result_paths = [Path(path).resolve() for path in result_paths]
+    _require(len(result_paths) == 3, "Se requieren exactamente tres resultados oficiales.")
+    _require(all(path.is_relative_to((Path(base_dir) / "results/transformer").resolve())
+                 for path in result_paths), "Comparar archivos bajo results/transformer/.")
+    results = [validate_official_result(json.loads(path.read_text("utf-8")), base_dir)
+               for path in result_paths]
+    experiment_ids = [r["experiment_id"] for r in results]
+    _require(len(set(experiment_ids)) == 3, "No se admiten experimentos duplicados.")
+    _require(set(experiment_ids) == set(EXPERIMENT_LEARNING_RATES),
+             "Se requieren exactamente T1, T2 y T3.")
+    _require(len({r["run_id"] for r in results}) == 3, "Cada experimento necesita un run ID distinto.")
+    _require(len({r["git"]["transformer_script_sha256"] for r in results}) == 1,
+             "Los tres experimentos deben usar el mismo código de entrenamiento.")
+    references = {
+        "git_commit": {r["git_commit"] for r in results},
+        "configs/transformer.json SHA-256": {r["configuration_sha256"] for r in results},
+        "train SHA-256": {r["data"]["train"]["sha256"] for r in results},
+        "validation SHA-256": {r["data"]["validation"]["sha256"] for r in results},
+        "revisión de BETO": {r["initial_checkpoint"]["revision"] for r in results},
+    }
+    for field, values in references.items():
+        _require(len(values) == 1, f"Resultados incompatibles: {field} debe coincidir.")
+    source_paths = {r["run_id"]: path.relative_to(Path(base_dir).resolve()).as_posix()
+                    for r, path in zip(results, result_paths)}
+    rows = []
+    for result in sorted(results, key=lambda row: row["experiment_id"]):
+        rows.append({**result["selected"], "runtime_seconds": result["runtime_seconds"],
+                     "git_commit": result["git_commit"], "working_tree_clean": True,
+                     "configuration_sha256": result["configuration_sha256"], "git": result["git"],
+                     "result_path": source_paths[result["run_id"]]})
+    selected = select_validation_candidate(rows)
+    summary = {"official": True, "test_used": False, "evaluation_partition": "validation",
+               "selection_rule": SELECTION_RULE, "experiments": [
+                   {**row, "selected": row is selected} for row in rows],
+               "selected_experiment_id": selected["experiment_id"],
+               "selected_run_id": selected["run_id"], "selected_checkpoint": selected["checkpoint"]}
+    output = Path(output_path) if output_path else Path(base_dir) / "results/transformer/validation_summary.json"
+    _require(output.resolve().is_relative_to((Path(base_dir) / "results/transformer").resolve()),
+             "Resumen debe quedar bajo results/transformer/.")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("xb") as stream:
+        stream.write(_json_bytes(summary))
+    return summary
 
 
 def verify_smoke_save_reload(trainer, reloaded, batch, diagnostics_path):
@@ -815,28 +1159,45 @@ def run_smoke_test(learning_rate, physical_batch_size, precision, device="auto",
     return result
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--record-max-length", action="store_true",
-                        help="Actualiza explícitamente configs/transformer.json después del análisis.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--record-max-length", action="store_true",
+                      help="Registra explícitamente la longitud después del análisis de train.")
     parser.add_argument("--local-files-only", action="store_true",
                         help="Usa únicamente el tokenizer ya descargado en la caché local.")
-    parser.add_argument("--smoke-test", action="store_true", help="Ejecuta el smoke técnico NO OFICIAL.")
+    mode.add_argument("--smoke-test", action="store_true", help="Ejecuta el smoke técnico NO OFICIAL.")
+    mode.add_argument("--experiment", choices=list(EXPERIMENT_LEARNING_RATES),
+                      help="Ejecuta un run oficial nuevo de T1, T2 o T3, con protocolo fijo.")
+    mode.add_argument("--summarize", nargs=3, type=Path, metavar="RESULT_JSON",
+                      help="Compara tres validation_result.json oficiales, uno por experimento.")
+    parser.add_argument("--summary-output", type=Path,
+                        help="Ruta nueva bajo results/transformer/; no sobrescribe un resumen anterior.")
     parser.add_argument("--learning-rate", type=float, choices=[1e-5, 2e-5, 3e-5])
     parser.add_argument("--physical-batch-size", type=int, choices=[8, 16])
     parser.add_argument("--precision", choices=["fp32", "fp16", "bf16"])
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
-    args = parser.parse_args()
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"])
+    args = parser.parse_args(argv)
+    overrides = (args.learning_rate, args.physical_batch_size, args.precision, args.device)
+    if args.summary_output and not args.summarize:
+        parser.error("--summary-output requiere --summarize.")
+    if args.experiment or args.summarize:
+        if any(value is not None for value in overrides):
+            parser.error("Experimentos oficiales/comparación no admiten overrides de entrenamiento.")
+        result = (run_official_experiment(args.experiment, local_files_only=args.local_files_only)
+                  if args.experiment else summarize_validation(args.summarize, output_path=args.summary_output))
+        print(_json_bytes(result).decode("utf-8"), end="")
+        return
     if args.smoke_test:
         if args.record_max_length:
             parser.error("El smoke no modifica configs/transformer.json.")
         if any(value is None for value in (args.learning_rate, args.physical_batch_size, args.precision)):
             parser.error("Smoke requiere --learning-rate, --physical-batch-size y --precision explícitos.")
         result = run_smoke_test(args.learning_rate, args.physical_batch_size, args.precision,
-                                args.device, local_files_only=args.local_files_only)
+                                args.device or "auto", local_files_only=args.local_files_only)
         print(_json_bytes(result).decode("utf-8"), end="")
         return
-    if any(value is not None for value in (args.learning_rate, args.physical_batch_size, args.precision)):
+    if any(value is not None for value in overrides):
         parser.error("Los argumentos de entrenamiento requieren --smoke-test.")
     config = load_config()
     set_seed(config["seed"])
