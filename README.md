@@ -68,3 +68,15 @@ pln-sentimiento-estudiantil/
 ├── tests/
 └── results/
     └── final/
+
+## Declaración de uso de IA generativa
+
+Durante el desarrollo del proyecto se utilizó **ChatGPT** como herramienta de apoyo en distintas actividades de documentación, análisis y desarrollo.
+
+| Herramienta | Uso en el proyecto | Verificación realizada |
+| --- | --- | --- |
+| ChatGPT | Apoyo en la redacción y revisión de documentación, estructuración de explicaciones, análisis e interpretación de resultados, preparación del material educativo y revisión de fragmentos de código. | Las respuestas y sugerencias fueron contrastadas con los notebooks ejecutados, las salidas reales del pipeline, los archivos versionados del repositorio y la documentación técnica correspondiente. |
+
+La IA generativa se utilizó como herramienta de apoyo y no sustituyó la ejecución ni la validación experimental del proyecto. El código, las particiones de datos, las métricas y los resultados reportados fueron revisados por los integrantes del equipo a partir de las ejecuciones y artefactos reales del proyecto.
+
+Las decisiones metodológicas finales, la selección de modelos y la interpretación de los resultados fueron realizadas y validadas por los integrantes del equipo.
