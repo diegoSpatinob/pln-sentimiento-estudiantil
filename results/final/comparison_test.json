@@ -1,0 +1,228 @@
+{
+  "better_f1_macro_on_test": "transformer_T2",
+  "comparison_is_descriptive_only": true,
+  "delta_transformer_minus_baseline": {
+    "accuracy": 0.03978091669068895,
+    "f1_macro": 0.04111069587483285,
+    "precision_macro": 0.03968590163770358,
+    "recall_macro": 0.04266288857416123
+  },
+  "evaluation_partition": "test",
+  "models": {
+    "baseline_C1": {
+      "confusion_matrix": {
+        "columns": "predicho",
+        "labels": [
+          0,
+          1
+        ],
+        "rows": "real",
+        "values": [
+          [
+            1240,
+            233
+          ],
+          [
+            220,
+            1776
+          ]
+        ]
+      },
+      "created_at_utc": "2026-10-04T07:43:20.287261+00:00",
+      "data": {
+        "metadata_sha256": "92a24524587855f76d0fbcb19a4e5513efe329f708d762c96d61ec879eeefcf4",
+        "path": "data/processed/test.csv",
+        "records": 3469,
+        "sha256": "f1e7c5da7760aaf3ee0f89c3d86d1307db5a347cb1b543f551276b12e9c7851b"
+      },
+      "evaluation_git": {
+        "commit": "ddc3d2e51246e8450a0d000cd48af55bf101f878",
+        "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "dirty": false,
+        "transformer_script_sha256": "12f1c70b50c8035d403a2bf81f984fb25f3f6bc5d059822f43c6cdc168b056e2"
+      },
+      "evaluation_partition": "test",
+      "evaluation_script_sha256": "40937c50f2a503342090382be2e5e8b1db397d1aa2cd1cee3b326dfe17097ebf",
+      "label_mapping": {
+        "Negativo": 0,
+        "Positivo": 1
+      },
+      "metrics": {
+        "accuracy": 0.8694148169501297,
+        "f1_macro": 0.8662210082606425,
+        "precision_macro": 0.8666684849683275,
+        "recall_macro": 0.8657994876378691
+      },
+      "model": {
+        "config_id": "C1",
+        "fit_partition": "train",
+        "metadata_sha256": "6b0796976cd0272f7636acbd02c7f12d84414d327a76f10126b55829023295d9",
+        "path": "models/baseline_C1.joblib",
+        "sha256": "7654a99a32068fee9442d647adcd3b3b6969f1bb8feafe034147d71138f622c0"
+      },
+      "model_key": "baseline_C1",
+      "per_class": [
+        {
+          "class_id": 0,
+          "class_label": "Negativo",
+          "f1": 0.8455506307534947,
+          "precision": 0.8493150684931506,
+          "recall": 0.8418194161575017,
+          "support": 1473
+        },
+        {
+          "class_id": 1,
+          "class_label": "Positivo",
+          "f1": 0.8868913857677903,
+          "precision": 0.8840219014435042,
+          "recall": 0.8897795591182365,
+          "support": 1996
+        }
+      ],
+      "phase": "final_test_evaluation",
+      "predictive_evaluations": 1,
+      "predictors": [
+        "comentario_limpio"
+      ],
+      "reselection_performed": false,
+      "runtime": {
+        "device": "cpu",
+        "joblib": "1.6.0",
+        "numpy": "2.1.3",
+        "python": "3.12.3",
+        "scikit_learn": "1.6.1"
+      },
+      "runtime_seconds": 0.04170182400048361,
+      "schema_version": 1,
+      "selection_frozen": true,
+      "target_column": "sentimiento_id",
+      "test_used": true,
+      "training_performed": false
+    },
+    "transformer_T2": {
+      "confusion_matrix": {
+        "columns": "predicho",
+        "labels": [
+          0,
+          1
+        ],
+        "rows": "real",
+        "values": [
+          [
+            1331,
+            142
+          ],
+          [
+            173,
+            1823
+          ]
+        ]
+      },
+      "created_at_utc": "2026-10-04T07:40:51.294205+00:00",
+      "data": {
+        "metadata_sha256": "92a24524587855f76d0fbcb19a4e5513efe329f708d762c96d61ec879eeefcf4",
+        "path": "data/processed/test.csv",
+        "records": 3469,
+        "sha256": "f1e7c5da7760aaf3ee0f89c3d86d1307db5a347cb1b543f551276b12e9c7851b"
+      },
+      "evaluation_git": {
+        "commit": "ddc3d2e51246e8450a0d000cd48af55bf101f878",
+        "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "dirty": false,
+        "transformer_script_sha256": "12f1c70b50c8035d403a2bf81f984fb25f3f6bc5d059822f43c6cdc168b056e2"
+      },
+      "evaluation_partition": "test",
+      "evaluation_script_sha256": "40937c50f2a503342090382be2e5e8b1db397d1aa2cd1cee3b326dfe17097ebf",
+      "label_mapping": {
+        "Negativo": 0,
+        "Positivo": 1
+      },
+      "metrics": {
+        "accuracy": 0.9091957336408186,
+        "f1_macro": 0.9073317041354754,
+        "precision_macro": 0.9063543866060311,
+        "recall_macro": 0.9084623762120303
+      },
+      "model": {
+        "checkpoint": "checkpoint-3036",
+        "checkpoint_path": "/content/drive/MyDrive/pln-sentimiento-estudiantil/transformer_ganador/RUN_265ff1dcbdb94a6d95f49abc552ee758/checkpoint-3036",
+        "configuration_sha256": "2bb202463f79de75f2f3afcd4b9d5300b16c9780a67a8dfcf7eb51050e85f29d",
+        "epoch": 3,
+        "experiment_id": "T2",
+        "files_sha256": {
+          "config.json": "2952ddaf80450c4f37c86b4d134df0efe926336d21eac115ec25c43dd7324023",
+          "model.safetensors": "420d24970074083dee181e7faa380ebfb132e48b287f2c1ce6bf6663677ea9d8",
+          "special_tokens_map.json": "5d5b662e421ea9fac075174bb0688ee0d9431699900b90662acd44b2a350503a",
+          "tokenizer.json": "19b81454892d4fea517c4b3451266e52f17fa67c18897d362c7a3436b5cd6ee9",
+          "tokenizer_config.json": "32761d10ecdb004a090472cd8526f936fb14c66b04ef3565ac5f8f5b1a53f8cc",
+          "trainer_state.json": "e3a2a7a5510c706d06648bf446aa86ee6da1c6e55f7ffdd481767a8c3cf40495",
+          "vocab.txt": "b8f1c939e21273bd19cd885d0b6d7eb11244240ef81f62e30dcf84b4c970ce36"
+        },
+        "git_commit": "90afa082979bbe396f5a6a4906cadee9c351dd4f",
+        "global_step": 3036,
+        "learning_rate": 2e-05,
+        "model_id": "dccuchile/bert-base-spanish-wwm-cased",
+        "model_revision": "c4d86612f51b4f46759c8390d1798c2febe71b93",
+        "run_id": "RUN_265ff1dcbdb94a6d95f49abc552ee758",
+        "run_manifest_sha256": "1a94635f70a6a2783214080c635eb8f3f8a996e7491791ece42ebf48b31ffc65",
+        "selection_source": "winner_frozen_before_test_by_user_and_validation"
+      },
+      "model_key": "transformer_T2",
+      "per_class": [
+        {
+          "class_id": 0,
+          "class_label": "Negativo",
+          "f1": 0.8941887806516627,
+          "precision": 0.8849734042553191,
+          "recall": 0.9035980991174474,
+          "support": 1473
+        },
+        {
+          "class_id": 1,
+          "class_label": "Positivo",
+          "f1": 0.9204746276192881,
+          "precision": 0.927735368956743,
+          "recall": 0.9133266533066132,
+          "support": 1996
+        }
+      ],
+      "phase": "final_test_evaluation",
+      "predictive_evaluations": 1,
+      "predictors": [
+        "comentario_limpio"
+      ],
+      "reselection_performed": false,
+      "runtime": {
+        "batch_size": 16,
+        "cuda_available": false,
+        "cuda_runtime": null,
+        "device": "cpu",
+        "gpu": [],
+        "max_length": 128,
+        "precision": "fp32",
+        "precision_support": {
+          "bf16": false,
+          "fp16": false,
+          "fp32": true
+        },
+        "python": "3.13.15",
+        "torch": "2.11.0+cpu",
+        "torch_available": true,
+        "transformers": "4.57.1"
+      },
+      "runtime_seconds": 876.8544450660006,
+      "schema_version": 1,
+      "selection_frozen": true,
+      "target_column": "sentimiento_id",
+      "test_used": true,
+      "training_performed": false
+    }
+  },
+  "phase": "final_test_evaluation",
+  "reselection_performed": false,
+  "source_sha256": {
+    "baseline": "266031617bdc161f962aacbad7977501f3e837e1ab1658a15689d0474321ea58",
+    "transformer": "a36d51c6682ccc8a13526d21088149574ea6ead4a59cfa5808e99a245c038ac1"
+  },
+  "test_used": true
+}

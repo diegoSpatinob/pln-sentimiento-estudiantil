@@ -15,10 +15,16 @@ Thumbs.db
 
 # Datos y resultados generados localmente
 /data/raw/
-/data/processed/
+/data/processed/*
+!/data/processed/metadata.json
 /models/
 /results/*
 !/results/README.md
+!/results/final/
+/results/final/*
+!/results/final/transformer_T2_test.json
+!/results/final/baseline_C1_test.json
+!/results/final/comparison_test.json
 
 # No versionar archivos descargados o artefactos de ejecución
 *.joblib

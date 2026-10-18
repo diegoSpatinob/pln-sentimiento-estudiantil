@@ -1,0 +1,90 @@
+{
+  "confusion_matrix": {
+    "columns": "predicho",
+    "labels": [
+      0,
+      1
+    ],
+    "rows": "real",
+    "values": [
+      [
+        1240,
+        233
+      ],
+      [
+        220,
+        1776
+      ]
+    ]
+  },
+  "created_at_utc": "2026-10-04T07:43:20.287261+00:00",
+  "data": {
+    "metadata_sha256": "92a24524587855f76d0fbcb19a4e5513efe329f708d762c96d61ec879eeefcf4",
+    "path": "data/processed/test.csv",
+    "records": 3469,
+    "sha256": "f1e7c5da7760aaf3ee0f89c3d86d1307db5a347cb1b543f551276b12e9c7851b"
+  },
+  "evaluation_git": {
+    "commit": "ddc3d2e51246e8450a0d000cd48af55bf101f878",
+    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "dirty": false,
+    "transformer_script_sha256": "12f1c70b50c8035d403a2bf81f984fb25f3f6bc5d059822f43c6cdc168b056e2"
+  },
+  "evaluation_partition": "test",
+  "evaluation_script_sha256": "40937c50f2a503342090382be2e5e8b1db397d1aa2cd1cee3b326dfe17097ebf",
+  "label_mapping": {
+    "Negativo": 0,
+    "Positivo": 1
+  },
+  "metrics": {
+    "accuracy": 0.8694148169501297,
+    "f1_macro": 0.8662210082606425,
+    "precision_macro": 0.8666684849683275,
+    "recall_macro": 0.8657994876378691
+  },
+  "model": {
+    "config_id": "C1",
+    "fit_partition": "train",
+    "metadata_sha256": "6b0796976cd0272f7636acbd02c7f12d84414d327a76f10126b55829023295d9",
+    "path": "models/baseline_C1.joblib",
+    "sha256": "7654a99a32068fee9442d647adcd3b3b6969f1bb8feafe034147d71138f622c0"
+  },
+  "model_key": "baseline_C1",
+  "per_class": [
+    {
+      "class_id": 0,
+      "class_label": "Negativo",
+      "f1": 0.8455506307534947,
+      "precision": 0.8493150684931506,
+      "recall": 0.8418194161575017,
+      "support": 1473
+    },
+    {
+      "class_id": 1,
+      "class_label": "Positivo",
+      "f1": 0.8868913857677903,
+      "precision": 0.8840219014435042,
+      "recall": 0.8897795591182365,
+      "support": 1996
+    }
+  ],
+  "phase": "final_test_evaluation",
+  "predictive_evaluations": 1,
+  "predictors": [
+    "comentario_limpio"
+  ],
+  "reselection_performed": false,
+  "runtime": {
+    "device": "cpu",
+    "joblib": "1.6.0",
+    "numpy": "2.1.3",
+    "python": "3.12.3",
+    "scikit_learn": "1.6.1"
+  },
+  "runtime_seconds": 0.04170182400048361,
+  "schema_version": 1,
+  "selection_frozen": true,
+  "target_column": "sentimiento_id",
+  "test_used": true,
+  "training_performed": false
+}
